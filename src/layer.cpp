@@ -29,8 +29,10 @@ std::map<void*, VkInstance>       g_instHandle;
 
 struct DeviceState {
     DeviceDispatch dd;
+    VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice phys = VK_NULL_HANDLE;
     const InstanceDispatch* id = nullptr;
+    VkPhysicalDeviceMemoryProperties memProps{};
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queueFamily = 0;
     FrameGen fg;
@@ -49,16 +51,130 @@ static long long stat_mtime(const std::string& p) {
 }
 std::map<void*, DeviceState> g_dev;
 
+// One in-flight generate+present cycle's sync objects.
+struct FrameCtx {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence   fence      = VK_NULL_HANDLE;  // compute+copy done
+    VkSemaphore acquireSem = VK_NULL_HANDLE; // spare image acquired
+    VkSemaphore genSem   = VK_NULL_HANDLE;   // generated frame ready to present
+    VkSemaphore currSem  = VK_NULL_HANDLE;   // real frame ready to present
+    bool submitted = false;
+};
+
 struct SwapState {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat format{}; VkExtent2D extent{};
     std::vector<VkImage> images;
     std::vector<VkImageView> views;
-    // owned prev-frame copy + generated target (device bring-up)
-    bool havePrev = false;
-    uint32_t lastIndex = 0;
+
+    // ── Phase 3 frame-insertion resources ────────────────────────────────────
+    VkImage       prevImg  = VK_NULL_HANDLE;  // owned copy of the last real frame
+    VkDeviceMemory prevMem = VK_NULL_HANDLE;
+    VkImageView   prevView = VK_NULL_HANDLE;
+    bool          prevValid = false;
+    VkCommandPool cmdPool  = VK_NULL_HANDLE;
+    std::vector<FrameCtx> ring;               // small ring so we don't stall every frame
+    uint32_t      ringIdx  = 0;
+    bool          insertReady = false;
 };
+
+// Create an owned 2D color image + view (used for the prev-frame copy).
+static bool makeOwnedImage(const DeviceDispatch& dd, const VkPhysicalDeviceMemoryProperties& mp,
+                           VkDevice dev, VkExtent2D ext, VkFormat fmt, VkImageUsageFlags usage,
+                           VkImage& img, VkDeviceMemory& mem, VkImageView& view) {
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D; ci.format = fmt; ci.extent = {ext.width, ext.height, 1};
+    ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL; ci.usage = usage;
+    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (dd.CreateImage(dev, &ci, nullptr, &img) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr; dd.GetImageMemoryRequirements(dev, img, &mr);
+    uint32_t idx = 0;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        if ((mr.memoryTypeBits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { idx = i; break; }
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size; ai.memoryTypeIndex = idx;
+    if (dd.AllocateMemory(dev, &ai, nullptr, &mem) != VK_SUCCESS) return false;
+    if (dd.BindImageMemory(dev, img, mem, 0) != VK_SUCCESS) return false;
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    return dd.CreateImageView(dev, &vi, nullptr, &view) == VK_SUCCESS;
+}
+
+static void imgBarrier(const DeviceDispatch& dd, VkCommandBuffer cmd, VkImage img,
+                       VkImageLayout from, VkImageLayout to,
+                       VkAccessFlags srcA, VkAccessFlags dstA,
+                       VkPipelineStageFlags srcS, VkPipelineStageFlags dstS) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = from; b.newLayout = to; b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+    b.image = img; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dd.CmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
 std::map<VkSwapchainKHR, SwapState> g_swap;
+
+// Owned RGBA8 target the synth writes into, then blit to the BGRA swapchain image
+// (blit handles the R/B channel order, so no storage-format swizzle bug).
+struct GenTarget { VkImage img = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE; VkImageView view = VK_NULL_HANDLE; };
+std::map<VkSwapchainKHR, GenTarget> g_gen;
+
+static const int kRing = 2;
+
+// Create prev-copy image, gen target, command pool + ring for one swapchain.
+static bool initInsert(SwapState& s, DeviceState& ds) {
+    const DeviceDispatch& dd = ds.dd; VkDevice dev = ds.device;
+    if (!makeOwnedImage(dd, ds.memProps, dev, s.extent, s.format,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            s.prevImg, s.prevMem, s.prevView)) { WFG_LOGE("initInsert prev image failed"); return false; }
+    GenTarget g;
+    if (!makeOwnedImage(dd, ds.memProps, dev, s.extent, VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            g.img, g.mem, g.view)) { WFG_LOGE("initInsert gen image failed"); return false; }
+    g_gen[s.swapchain] = g;
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pci.queueFamilyIndex = ds.queueFamily;
+    if (dd.CreateCommandPool(dev, &pci, nullptr, &s.cmdPool) != VK_SUCCESS) { WFG_LOGE("initInsert cmdpool failed"); return false; }
+    s.ring.resize(kRing);
+    for (auto& fc : s.ring) {
+        VkCommandBufferAllocateInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ci.commandPool = s.cmdPool; ci.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ci.commandBufferCount = 1;
+        dd.AllocateCommandBuffers(dev, &ci, &fc.cmd);
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        dd.CreateFence(dev, &fi, nullptr, &fc.fence);
+        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        dd.CreateSemaphore(dev, &si, nullptr, &fc.acquireSem);
+        dd.CreateSemaphore(dev, &si, nullptr, &fc.genSem);
+        dd.CreateSemaphore(dev, &si, nullptr, &fc.currSem);
+    }
+    s.prevValid = false; s.ringIdx = 0; s.insertReady = true;
+    WFG_LOGI("insert resources ready (%ux%u ring=%d)", s.extent.width, s.extent.height, kRing);
+    return true;
+}
+
+static void destroyInsert(SwapState& s, DeviceState& ds) {
+    const DeviceDispatch& dd = ds.dd; VkDevice dev = ds.device;
+    if (dev && dd.DeviceWaitIdle) dd.DeviceWaitIdle(dev);
+    for (auto& fc : s.ring) {
+        if (fc.fence) dd.DestroyFence(dev, fc.fence, nullptr);
+        if (fc.acquireSem) dd.DestroySemaphore(dev, fc.acquireSem, nullptr);
+        if (fc.genSem) dd.DestroySemaphore(dev, fc.genSem, nullptr);
+        if (fc.currSem) dd.DestroySemaphore(dev, fc.currSem, nullptr);
+    }
+    s.ring.clear();
+    if (s.cmdPool) dd.DestroyCommandPool(dev, s.cmdPool, nullptr); s.cmdPool = VK_NULL_HANDLE;
+    if (s.prevView) dd.DestroyImageView(dev, s.prevView, nullptr);
+    if (s.prevImg) dd.DestroyImage(dev, s.prevImg, nullptr);
+    if (s.prevMem) dd.FreeMemory(dev, s.prevMem, nullptr);
+    s.prevImg = VK_NULL_HANDLE; s.prevMem = VK_NULL_HANDLE; s.prevView = VK_NULL_HANDLE;
+    auto it = g_gen.find(s.swapchain);
+    if (it != g_gen.end()) {
+        if (it->second.view) dd.DestroyImageView(dev, it->second.view, nullptr);
+        if (it->second.img) dd.DestroyImage(dev, it->second.img, nullptr);
+        if (it->second.mem) dd.FreeMemory(dev, it->second.mem, nullptr);
+        g_gen.erase(it);
+    }
+    s.insertReady = false; s.prevValid = false;
+}
 
 template <typename T> T next_gipa(const void* pNext, VkStructureType, VkLayerFunction);
 } // namespace
@@ -155,6 +271,8 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     st.id->GetPhysicalDeviceQueueFamilyProperties(phys, &qfc, qf.data());
     for (uint32_t i = 0; i < qfc; ++i) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { st.queueFamily = i; break; }
     dd.GetDeviceQueue(*pDevice, st.queueFamily, 0, &st.queue);
+    st.device = *pDevice;
+    st.id->GetPhysicalDeviceMemoryProperties(phys, &st.memProps);
     g_dev[dispatch_key(*pDevice)] = std::move(st);
     auto& ds = g_dev[dispatch_key(*pDevice)];
     WFG_LOGI("CreateDevice ok (enable=%d model=%d mult=%d flowScale=%.2f computeQF=%u)",
@@ -209,6 +327,7 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
     if (st.fgInited) {
         if (!st.fg.onResize(s.extent, s.format))
             WFG_LOGE("framegen onResize FAILED for %ux%u", s.extent.width, s.extent.height);
+        if (!initInsert(s, st)) WFG_LOGE("initInsert failed — FG will passthrough");
     }
     g_swap[*pSwapchain] = std::move(s);
     return VK_SUCCESS;
@@ -218,7 +337,11 @@ extern "C" void VKAPI_CALL winfg_DestroySwapchainKHR(VkDevice device, VkSwapchai
     std::lock_guard<std::mutex> lk(g_lock);
     auto& st = g_dev[dispatch_key(device)];
     auto it = g_swap.find(swapchain);
-    if (it != g_swap.end()) { for (auto v : it->second.views) if (v) st.dd.DestroyImageView(device, v, nullptr); g_swap.erase(it); }
+    if (it != g_swap.end()) {
+        destroyInsert(it->second, st);
+        for (auto v : it->second.views) if (v) st.dd.DestroyImageView(device, v, nullptr);
+        g_swap.erase(it);
+    }
     st.dd.DestroySwapchainKHR(device, swapchain, pAlloc);
 }
 
@@ -260,6 +383,85 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
         lastEnabled = en;
     }
     ++presents;
+
+    // ── Phase 3a: synthesise the interpolated frame and blit it over the current
+    // swapchain image (single present). Proves the synth on real frames on-screen;
+    // true extra-frame insertion (2x) is Phase 3b. ────────────────────────────
+    bool doGen = st->cfg.enabled && st->cfg.multiplier >= 2 && st->fg.valid()
+                 && pPresentInfo->swapchainCount == 1;
+    if (doGen) {
+        VkSwapchainKHR sc = pPresentInfo->pSwapchains[0];
+        uint32_t idx = pPresentInfo->pImageIndices[0];
+        auto sit = g_swap.find(sc);
+        auto git = g_gen.find(sc);
+        if (sit != g_swap.end() && sit->second.insertReady && git != g_gen.end()
+            && idx < sit->second.images.size()) {
+            SwapState& s = sit->second;
+            GenTarget& gt = git->second;
+            const DeviceDispatch& dd = st->dd;
+            VkDevice dev = st->device;
+            FrameCtx& fc = s.ring[s.ringIdx];
+            s.ringIdx = (s.ringIdx + 1) % s.ring.size();
+            if (fc.submitted) { dd.WaitForFences(dev, 1, &fc.fence, VK_TRUE, UINT64_MAX); dd.ResetFences(dev, 1, &fc.fence); fc.submitted = false; }
+
+            VkImage currImg = s.images[idx];
+            VkImageView currView = s.views[idx];
+            const VkImageLayout SR = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            const VkImageLayout PS = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            const VkImageLayout TS = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            const VkImageLayout TD = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            const auto ALL = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            const auto CS  = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            const auto TR  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            VkImageCopy cp{}; cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; cp.dstSubresource = cp.srcSubresource;
+            cp.extent = {s.extent.width, s.extent.height, 1};
+
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            dd.BeginCommandBuffer(fc.cmd, &bi);
+
+            if (!s.prevValid) {
+                // first frame after enable: capture curr -> prev, leave curr untouched
+                imgBarrier(dd, fc.cmd, currImg, PS, TS, 0, VK_ACCESS_TRANSFER_READ_BIT, ALL, TR);
+                imgBarrier(dd, fc.cmd, s.prevImg, VK_IMAGE_LAYOUT_UNDEFINED, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, TR);
+                dd.CmdCopyImage(fc.cmd, currImg, TS, s.prevImg, TD, 1, &cp);
+                imgBarrier(dd, fc.cmd, s.prevImg, TD, SR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
+                imgBarrier(dd, fc.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL);
+                s.prevValid = true;
+                if (presents < 5) WFG_LOGI("prev captured (first FG frame)");
+            } else {
+                imgBarrier(dd, fc.cmd, currImg, PS, SR, 0, VK_ACCESS_SHADER_READ_BIT, ALL, CS);
+                imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, CS);
+                st->fg.record(fc.cmd, s.prevView, currView, gt.view, 0.5f);          // synth -> gen (rgba8)
+                imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_GENERAL, TS, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
+                imgBarrier(dd, fc.cmd, currImg, SR, TS, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
+                imgBarrier(dd, fc.cmd, s.prevImg, SR, TD, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, TR);
+                dd.CmdCopyImage(fc.cmd, currImg, TS, s.prevImg, TD, 1, &cp);           // real curr -> prev (next frame)
+                imgBarrier(dd, fc.cmd, s.prevImg, TD, SR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
+                imgBarrier(dd, fc.cmd, currImg, TS, TD, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, TR, TR);
+                VkImageBlit bl{}; bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; bl.dstSubresource = bl.srcSubresource;
+                bl.srcOffsets[1] = {(int)s.extent.width,(int)s.extent.height,1}; bl.dstOffsets[1] = bl.srcOffsets[1];
+                dd.CmdBlitImage(fc.cmd, gt.img, TS, currImg, TD, 1, &bl, VK_FILTER_NEAREST); // gen (rgba) -> curr (bgra), R/B handled
+                imgBarrier(dd, fc.cmd, currImg, TD, PS, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, ALL);
+            }
+            dd.EndCommandBuffer(fc.cmd);
+
+            std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount, ALL);
+            VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            su.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+            su.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+            su.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
+            su.commandBufferCount = 1; su.pCommandBuffers = &fc.cmd;
+            su.signalSemaphoreCount = 1; su.pSignalSemaphores = &fc.currSem;
+            dd.QueueSubmit(st->queue, 1, &su, fc.fence);
+            fc.submitted = true;
+
+            VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+            pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &fc.currSem;
+            pi.swapchainCount = 1; pi.pSwapchains = &sc; pi.pImageIndices = &idx;
+            return st->dd.QueuePresentKHR(queue, &pi);
+        }
+    }
     return st->dd.QueuePresentKHR(queue, pPresentInfo);
 }
 
