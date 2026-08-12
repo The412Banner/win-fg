@@ -229,9 +229,12 @@ extern "C" void VKAPI_CALL winfg_DestroySwapchainKHR(VkDevice device, VkSwapchai
 // present (the actual 2x) is the device bring-up step — see docs/BRINGUP.md.
 extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
     std::lock_guard<std::mutex> lk(g_lock);
-    DeviceState* st = nullptr;
-    for (auto& kv : g_dev) if (dispatch_key(kv.first) == dispatch_key(queue)) { st = &kv.second; break; }
-    if (!st) return g_dev[dispatch_key(queue)].dd.QueuePresentKHR(queue, pPresentInfo);
+    // Queues share their device's dispatch pointer, so the device key IS the
+    // queue's dispatch key — look it up directly (the map key is already a
+    // dispatch key; applying dispatch_key() to it again would double-deref).
+    auto it = g_dev.find(dispatch_key(queue));
+    if (it == g_dev.end()) return VK_ERROR_DEVICE_LOST;
+    DeviceState* st = &it->second;
 
     // Hot-reload conf.toml so the in-game controls (enable / multiplier / model /
     // flow scale) reach the layer live. Cheap stat every present; only re-read the
