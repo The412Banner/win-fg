@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.18)
+project(win_fg CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+
+# VULKAN_INCLUDE points at a Vulkan-Headers include/ (vk_layer.h + vulkan.h).
+add_library(win_fg SHARED src/layer.cpp src/framegen.cpp)
+target_include_directories(win_fg PRIVATE src ${VULKAN_INCLUDE})
+target_compile_definitions(win_fg PRIVATE VK_NO_PROTOTYPES=1 VK_USE_PLATFORM_ANDROID_KHR)
+set_target_properties(win_fg PROPERTIES OUTPUT_NAME win_fg)
+if(ANDROID)
+  find_library(log-lib log)
+  target_link_libraries(win_fg ${log-lib})
+endif()

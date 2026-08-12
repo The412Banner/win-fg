@@ -78,3 +78,29 @@ is likewise pure algorithm.
 Everything above this line is ours or MIT. Nothing below the old boundary
 (traced warp/synth) is present. There is no path by which a proprietary weight
 reaches the output.
+
+## Host layer & synthesis math — sources (added with the Vulkan host)
+
+The Vulkan implicit-layer host (`src/layer.cpp`, `src/framegen.*`,
+`src/vk_dispatch.hpp`) was written from these open, permissively-licensed
+references. None of it is copied from bionic-fg / lsfg / GameScope.
+
+| Part | Sourced from | License |
+|---|---|---|
+| Layer negotiation / dispatch / present interception skeleton | Khronos Vulkan-Loader layer interface; renderdoc "Vulkan layer guide" | Apache-2.0 / CC-BY (docs) |
+| Vulkan headers (`vk_layer.h`, `vulkan.h`) | KhronosGroup/Vulkan-Headers | Apache-2.0 |
+| Compute pipeline / descriptor patterns | Khronos Vulkan-Samples; general Vulkan spec | Apache-2.0 |
+
+Synthesis **math** (implemented independently from the published equations — the
+math itself is not copyrightable; we do not use these projects' code):
+
+| Idea | Source |
+|---|---|
+| Importance-weighted blend of warped candidates ("softmax splatting") | Niklaus & Liu, CVPR 2020 (arXiv:2003.05534) — *code is non-commercial; we use only the published math* |
+| Brightness-constancy photometric residual | Horn & Schunck 1981 |
+| Forward/backward flow consistency occlusion test | Sundaram et al. 2010; OCAI (arXiv:2403.18092) |
+| Dual (prev/curr) disocclusion fallback concept | AMD FidelityFX FSR3 Frame Interpolation (MIT) |
+
+**Explicitly NOT used:** lsfg-vk and obs-vkcapture (GPL / avoided lineage), and
+the softmax-splatting *code* (non-commercial). Only permissive code and
+published math enter win-fg.
