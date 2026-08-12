@@ -102,6 +102,16 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     };
     auto bar = [&](FrameGen::Img& i){ barrier(cmd, i.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL); };
 
+    // Internal images are created UNDEFINED and fully recomputed every frame, so
+    // discard-transition them all to GENERAL up front (all descriptors use GENERAL
+    // for these). This also fixes the first-frame layout (storage writes require
+    // GENERAL, not UNDEFINED).
+    for (auto& i : pyrA_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    for (auto& i : pyrB_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    for (auto& i : flowLvl_) barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cmd, flowExpA_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cmd, flowExpB_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+
     // 1) luma of curr/prev at full res
     disp(pLuma_, g_scratch.sLumaCurr, levelExtent(extent_, 0));
     disp(pLuma_, g_scratch.sLumaPrev, levelExtent(extent_, 0));
@@ -186,8 +196,11 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
     // synth set: external prev/curr/out wired per frame; flow inputs fixed
     S.sSynth = allocSet(dd, dev, pool, pSynth.setLayout);
     wUbo(dd, dev, S.sSynth, 0, S.synthUbo, sizeof(SynthUBO));
-    wImg(dd, dev, S.sSynth, 34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, expA.view, samp, SR);
-    wImg(dd, dev, S.sSynth, 35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, expB.view, samp, SR);
+    // GENERAL (not SR): these internal flow images stay in GENERAL across the whole
+    // record() (written as storage by expand, sampled here) — see the discard
+    // transition at the top of record().
+    wImg(dd, dev, S.sSynth, 34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, expA.view, samp, GEN);
+    wImg(dd, dev, S.sSynth, 35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, expB.view, samp, GEN);
 
     S.builtFor = ext; S.built = true;
     return true;
