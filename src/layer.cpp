@@ -255,7 +255,7 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     L(AllocateDescriptorSets); L(UpdateDescriptorSets);
     L(CreateCommandPool); L(DestroyCommandPool); L(AllocateCommandBuffers); L(FreeCommandBuffers);
     L(BeginCommandBuffer); L(EndCommandBuffer); L(CmdBindPipeline); L(CmdBindDescriptorSets); L(CmdDispatch);
-    L(CmdPipelineBarrier); L(CmdCopyImage); L(CmdBlitImage);
+    L(CmdPipelineBarrier); L(CmdCopyImage); L(CmdBlitImage); L(CmdClearColorImage);
     L(CreateFence); L(DestroyFence); L(WaitForFences); L(ResetFences); L(CreateSemaphore); L(DestroySemaphore);
 #undef L
 
