@@ -1,0 +1,81 @@
+#version 450
+// ─────────────────────────────────────────────────────────────────────────────
+// win-fg — clean interpolated-frame synthesis (models 3 & 4 back end).
+//
+// CLEAN-ROOM STATEMENT
+// This pass replaces the traced bionic-fg / GameScope "stage 6" (warp shader_14
+// + synthesis shader_04). Those were reverse-engineered from the proprietary
+// Lossless Scaling fp16 frame-generation model and are NOT used, referenced, or
+// reimplemented here. This shader is written from first principles: standard
+// motion-compensated frame interpolation (bidirectional backward warp + linear
+// temporal blend + confidence-gated cross-fade). It contains no learned weights
+// and derives from no third-party compiled artifact. See docs/PROVENANCE.md.
+//
+// INPUTS  (all our own, upstream is the FSR3 optical-flow front end of3_*):
+//   binding 0  SynthUBO { flowScale, alpha, epsilon }
+//   binding 32 uPrev   prev color frame  (t = 0)        sampler2D
+//   binding 33 uCurr   curr color frame  (t = 1)        sampler2D
+//   binding 34 uFlowFwd flowExpA: .xy = curr->prev px, .w = confidence
+//   binding 35 uFlowBwd flowExpB: .xy = prev->curr px, .w = confidence
+// OUTPUT
+//   binding 48 uOut    generated frame at time = alpha  (writeonly image2D)
+//
+// MODEL MAPPING: the of3 front end already differentiates model 3 (symmetric
+// flow, conf = 1) from model 4 (independently-searched fwd/bwd, conf gated by
+// disagreement in of3_expand_m4). This synthesis is identical for both — it just
+// consumes whatever confidence the front end wrote, so model 4's occlusion
+// cross-fade "falls out" of the same math. No model branch needed here.
+// ─────────────────────────────────────────────────────────────────────────────
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform U {
+    float flowScale;   // scales flow magnitude (device tuning; 1.0 = as-solved)
+    float alpha;       // temporal position of the generated frame, 0=prev .. 1=curr
+    float epsilon;     // small guard for weight normalisation
+};
+
+layout(binding = 32) uniform sampler2D uPrev;
+layout(binding = 33) uniform sampler2D uCurr;
+layout(binding = 34) uniform sampler2D uFlowFwd;   // curr->prev (.xy px, .w conf)
+layout(binding = 35) uniform sampler2D uFlowBwd;   // prev->curr (.xy px, .w conf)
+
+layout(binding = 48, rgba8) uniform writeonly image2D uOut;
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dim = imageSize(uOut);
+    if (gid.x >= dim.x || gid.y >= dim.y) return;
+
+    vec2 invDim = 1.0 / vec2(dim);
+    vec2 uv = (vec2(gid) + 0.5) * invDim;
+
+    // Motion of the scene from prev(0) -> curr(1), in full-res pixels, converted
+    // to uv. of3_expand writes flowExpB = prev->curr; the confidence in .w is 1
+    // for model 3 and disagreement-gated for model 4.
+    vec4 fBwd = texture(uFlowBwd, uv);          // prev->curr
+    vec4 fFwd = texture(uFlowFwd, uv);          // curr->prev
+    vec2 F01  = fBwd.xy * flowScale * invDim;   // prev->curr in uv
+    float conf = min(fFwd.w, fBwd.w);           // trust the lower of the two
+
+    // ── Motion-compensated candidates (linear-motion assumption) ──────────────
+    // A scene point at output pixel uv, moving linearly between the two frames,
+    // sits at (uv - alpha*F01) in prev and (uv + (1-alpha)*F01) in curr.
+    //   alpha = 0  -> prevWarp = prev(uv),   currWarp = curr(uv + F01)
+    //   alpha = 1  -> prevWarp = prev(uv-F01), currWarp = curr(uv)
+    // so each endpoint reproduces its own real frame exactly.
+    vec3 prevWarp = texture(uPrev, uv - alpha * F01).rgb;
+    vec3 currWarp = texture(uCurr, uv + (1.0 - alpha) * F01).rgb;
+    vec3 warped   = mix(prevWarp, currWarp, alpha);   // temporal blend
+
+    // ── Zero-motion fallback: a straight cross-fade of the untouched frames. ──
+    // This is what a wrong or unknown vector should degrade to instead of
+    // smearing along a bad displacement — the source of the old ghosting.
+    vec3 crossfade = mix(texture(uPrev, uv).rgb, texture(uCurr, uv).rgb, alpha);
+
+    // Confidence picks how far we trust the warp over the safe cross-fade.
+    vec3 outc = mix(crossfade, warped, clamp(conf, 0.0, 1.0));
+
+    imageStore(uOut, gid, vec4(outc, 1.0));
+    // epsilon referenced to keep the UBO field live across drivers.
+    if (epsilon < 0.0) imageStore(uOut, gid, vec4(0.0));
+}

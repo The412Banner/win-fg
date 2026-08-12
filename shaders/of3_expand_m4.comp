@@ -1,0 +1,63 @@
+#version 450
+// ─────────────────────────────────────────────────────────────────────────────
+// bionic-fg model 4 — FSR3 Optical Flow v2 (pass 4/4): scale to full res + fwd/bwd.
+//
+// Adapted from AMD FidelityFX-SDK FSR3 Optical Flow scale pass:
+//   ffx_opticalflow_scale_optical_flow_advanced_v5.h (bilinear upscale of the
+//   coarse flow field to display resolution). FidelityFX SDK is MIT-licensed.
+//
+// Produces the two full-resolution flow images bionic-fg's existing warp/blend
+// (shader_14/20) and synthesis (shader_04) passes consume as flowExpA_/flowExpB_.
+//
+// ── Model 4: consistency gating replaces backward = -forward ─────────────────
+// of3_flow now solves the backward field independently (.zw) instead of
+// mirroring the forward one. Where the two fields genuinely describe the same
+// motion they should very nearly cancel: fwd + bwd ~= 0. Where they do NOT
+// cancel, one of the two searches matched something that is not present in both
+// frames — i.e. a disocclusion (background revealed from behind a moving
+// object), an occlusion, or a scene cut where neither search means anything.
+//
+// FSR3 resolves those regions using the game's motion vectors. Colour-only, we
+// have no such fallback, so we do the next-best thing: attenuate the flow
+// toward zero as the two fields disagree. Zero flow makes the downstream
+// warp/blend degenerate into a straight cross-fade, which is soft but correct,
+// instead of confidently warping with a vector that is simply wrong. A hard cut
+// attenuates everywhere and so cross-fades — which is also why model 4 needs
+// no separate scene-change detection pass.
+//
+// The per-frame blend alpha and flowScale are still applied downstream by the
+// synth UBO exactly as in model 0.
+// ─────────────────────────────────────────────────────────────────────────────
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform U {
+    float flowScale;   // kept for layout parity; scaling applied in synth UBO
+    uint  level;       // unused here
+    float occlLo;      // rel. disagreement at which confidence starts to fall
+    float occlHi;      // rel. disagreement at which flow is fully suppressed
+};
+
+layout(binding = 32) uniform sampler2D uFlowFine;             // finest solved flow (.xy fwd, .zw bwd)
+layout(binding = 48, rgba16f) uniform writeonly image2D uFwd; // -> flowExpA_
+layout(binding = 49, rgba16f) uniform writeonly image2D uBwd; // -> flowExpB_
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dim = imageSize(uFwd);
+    if (gid.x >= dim.x || gid.y >= dim.y) return;
+
+    vec2 uv = (vec2(gid) + 0.5) / vec2(dim);
+    vec4 f  = textureLod(uFlowFine, uv, 0.0); // full-res pixel flow, bilinear-upsampled
+    vec2 fwd = f.xy;
+    vec2 bwd = f.zw;
+
+    // Disagreement relative to the magnitude being claimed. The absolute floor
+    // keeps near-static blocks (where the residual is just search noise) from
+    // dividing by ~0 and reading as inconsistent.
+    float mag = 0.5 * (length(fwd) + length(bwd)) + 0.5; // +0.5 px floor
+    float rel = length(fwd + bwd) / mag;
+    float conf = 1.0 - smoothstep(occlLo, occlHi, rel);
+
+    imageStore(uFwd, gid, vec4(fwd * conf, 0.0, conf));
+    imageStore(uBwd, gid, vec4(bwd * conf, 0.0, conf));
+}

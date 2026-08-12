@@ -1,0 +1,84 @@
+#version 450
+// ─────────────────────────────────────────────────────────────────────────────
+// bionic-fg model 3 — FSR3 Optical Flow (pass 3/4): coarse-to-fine block flow.
+//
+// Adapted from AMD FidelityFX-SDK FSR3 Optical Flow search pass:
+//   ffx_opticalflow_compute_optical_flow_v5.h
+//   (SAD block-matching, BlockSize 8, SearchRadius 8, prediction from the
+//    previous coarser pyramid level). FidelityFX SDK is MIT-licensed; see NOTICE.
+//
+// This is a self-contained, subgroup-free re-implementation of that pass so it
+// compiles with glslangValidator for Vulkan 1.1 / Turnip. The SDK version uses
+// wave intrinsics (ffxWaveSum), groupshared SAD maps, msad4 and packed-uint
+// luma — none of which are portable to bare GLSL on Adreno — so this version
+// does a direct per-pixel SAD search instead.
+//
+// DEVIATIONS (documented for device verification):
+//  * Block half-window BR and search radius SR are reduced from the SDK's
+//    8x8 / +-8 to 3x3 / +-3 per level (the coarse->fine predictor chain recovers
+//    the large-motion range; smaller windows keep the non-subgroup loop fast
+//    enough to be Turnip-viable). Tune on device.
+//  * No sub-pixel (parabola) refinement; integer-texel best match per level.
+//  * Flow vectors are carried in FULL-RESOLUTION pixel units across all levels
+//    so the predictor needs no rescale between levels.
+// ─────────────────────────────────────────────────────────────────────────────
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform U {
+    float flowScale;   // unused here (applied in synth UBO); kept for layout parity
+    uint  level;       // pyramid level being solved (0 = full res)
+    uint  pad0;
+    uint  pad1;
+};
+
+layout(binding = 32) uniform sampler2D uLumaPrev;  // prev luma at this level (R8)
+layout(binding = 33) uniform sampler2D uLumaCurr;  // curr luma at this level (R8)
+layout(binding = 34) uniform sampler2D uPredictor; // coarser flow, full-res px (.xy)
+
+layout(binding = 48, rgba16f) uniform writeonly image2D uFlow; // flow, full-res px (.xy)
+
+const int BR = 1; // block half-window  -> (2*BR+1)^2 tap SAD  (3x3)
+const int SR = 3; // search radius      -> (2*SR+1)^2 candidates (+-3)
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dim = imageSize(uFlow);
+    if (gid.x >= dim.x || gid.y >= dim.y) return;
+
+    vec2 invDim = 1.0 / vec2(dim);
+    vec2 uv = (vec2(gid) + 0.5) * invDim;
+
+    // Predictor flow is stored in full-res pixels. Convert to this level's texels.
+    float toLevel = exp2(-float(level)); // full-res px -> level-i texels
+    vec2 predFull = textureLod(uPredictor, uv, 0.0).xy;
+    vec2 predLevel = predFull * toLevel;
+
+    float bestSad = 3.402823466e+38;
+    vec2  bestDisp = predLevel;
+
+    for (int sy = -SR; sy <= SR; ++sy) {
+        for (int sx = -SR; sx <= SR; ++sx) {
+            vec2 cand = predLevel + vec2(float(sx), float(sy)); // level texels
+            float sad = 0.0;
+            for (int by = -BR; by <= BR; ++by) {
+                for (int bx = -BR; bx <= BR; ++bx) {
+                    vec2 bo = vec2(float(bx), float(by));
+                    float p = textureLod(uLumaPrev, uv + bo * invDim, 0.0).r;
+                    float c = textureLod(uLumaCurr, uv + (bo + cand) * invDim, 0.0).r;
+                    sad += abs(p - c);
+                }
+            }
+            // Mild bias toward the predictor (smoothness prior, like the SDK's
+            // prediction term) so textureless regions keep the coarse flow.
+            sad += 0.002 * (abs(float(sx)) + abs(float(sy)));
+            if (sad < bestSad) {
+                bestSad = sad;
+                bestDisp = cand;
+            }
+        }
+    }
+
+    // Convert best displacement (level texels) back to full-res pixels.
+    vec2 flowFull = bestDisp * exp2(float(level));
+    imageStore(uFlow, gid, vec4(flowFull, 0.0, 0.0));
+}
