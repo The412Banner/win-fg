@@ -420,46 +420,82 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             dd.BeginCommandBuffer(fc.cmd, &bi);
 
+            auto submitOne = [&](VkSemaphore sig) {
+                std::vector<VkPipelineStageFlags> ws(pPresentInfo->waitSemaphoreCount, ALL);
+                VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                su.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+                su.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+                su.pWaitDstStageMask = ws.empty() ? nullptr : ws.data();
+                su.commandBufferCount = 1; su.pCommandBuffers = &fc.cmd;
+                su.signalSemaphoreCount = 1; su.pSignalSemaphores = &sig;
+                dd.QueueSubmit(st->queue, 1, &su, fc.fence); fc.submitted = true;
+            };
+            auto presentOne = [&](VkSemaphore wait, uint32_t image) {
+                VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+                pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &wait;
+                pi.swapchainCount = 1; pi.pSwapchains = &sc; pi.pImageIndices = &image;
+                return st->dd.QueuePresentKHR(queue, &pi);
+            };
+
             if (!s.prevValid) {
-                // first frame after enable: capture curr -> prev, leave curr untouched
+                // first FG frame: capture curr -> prev, present curr unchanged
                 imgBarrier(dd, fc.cmd, currImg, PS, TS, 0, VK_ACCESS_TRANSFER_READ_BIT, ALL, TR);
                 imgBarrier(dd, fc.cmd, s.prevImg, VK_IMAGE_LAYOUT_UNDEFINED, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, TR);
                 dd.CmdCopyImage(fc.cmd, currImg, TS, s.prevImg, TD, 1, &cp);
                 imgBarrier(dd, fc.cmd, s.prevImg, TD, SR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
                 imgBarrier(dd, fc.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL);
+                dd.EndCommandBuffer(fc.cmd);
+                submitOne(fc.currSem);
                 s.prevValid = true;
                 if (presents < 5) WFG_LOGI("prev captured (first FG frame)");
-            } else {
-                imgBarrier(dd, fc.cmd, currImg, PS, SR, 0, VK_ACCESS_SHADER_READ_BIT, ALL, CS);
-                imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, CS);
-                st->fg.record(fc.cmd, s.prevView, currView, gt.view, 0.5f);          // synth -> gen (rgba8)
-                imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_GENERAL, TS, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
-                imgBarrier(dd, fc.cmd, currImg, SR, TS, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
-                imgBarrier(dd, fc.cmd, s.prevImg, SR, TD, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, TR);
-                dd.CmdCopyImage(fc.cmd, currImg, TS, s.prevImg, TD, 1, &cp);           // real curr -> prev (next frame)
-                imgBarrier(dd, fc.cmd, s.prevImg, TD, SR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
-                imgBarrier(dd, fc.cmd, currImg, TS, TD, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, TR, TR);
-                VkImageBlit bl{}; bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; bl.dstSubresource = bl.srcSubresource;
-                bl.srcOffsets[1] = {(int)s.extent.width,(int)s.extent.height,1}; bl.dstOffsets[1] = bl.srcOffsets[1];
-                dd.CmdBlitImage(fc.cmd, gt.img, TS, currImg, TD, 1, &bl, VK_FILTER_NEAREST); // gen (rgba) -> curr (bgra), R/B handled
-                imgBarrier(dd, fc.cmd, currImg, TD, PS, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, ALL);
+                return presentOne(fc.currSem, idx);
             }
-            dd.EndCommandBuffer(fc.cmd);
 
-            std::vector<VkPipelineStageFlags> waitStages(pPresentInfo->waitSemaphoreCount, ALL);
-            VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            su.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
-            su.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
-            su.pWaitDstStageMask = waitStages.empty() ? nullptr : waitStages.data();
-            su.commandBufferCount = 1; su.pCommandBuffers = &fc.cmd;
-            su.signalSemaphoreCount = 1; su.pSignalSemaphores = &fc.currSem;
-            dd.QueueSubmit(st->queue, 1, &su, fc.fence);
-            fc.submitted = true;
+            // ── generate the in-between frame; try to insert it as an EXTRA present (2x) ──
+            uint32_t spareIdx = 0;
+            VkResult ar = dd.AcquireNextImageKHR(dev, sc, 2000000ull, fc.acquireSem, VK_NULL_HANDLE, &spareIdx);
+            bool insert = (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) && spareIdx < s.images.size();
 
-            VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-            pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &fc.currSem;
-            pi.swapchainCount = 1; pi.pSwapchains = &sc; pi.pImageIndices = &idx;
-            return st->dd.QueuePresentKHR(queue, &pi);
+            imgBarrier(dd, fc.cmd, currImg, PS, SR, 0, VK_ACCESS_SHADER_READ_BIT, ALL, CS);
+            imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, CS);
+            st->fg.record(fc.cmd, s.prevView, currView, gt.view, 0.5f);              // synth -> gen (rgba8)
+            imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_GENERAL, TS, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
+            imgBarrier(dd, fc.cmd, currImg, SR, TS, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
+            imgBarrier(dd, fc.cmd, s.prevImg, SR, TD, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, TR);
+            dd.CmdCopyImage(fc.cmd, currImg, TS, s.prevImg, TD, 1, &cp);              // real curr -> prev (next frame)
+            imgBarrier(dd, fc.cmd, s.prevImg, TD, SR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
+            VkImageBlit bl{}; bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; bl.dstSubresource = bl.srcSubresource;
+            bl.srcOffsets[1] = {(int)s.extent.width,(int)s.extent.height,1}; bl.dstOffsets[1] = bl.srcOffsets[1];
+
+            if (insert) {
+                imgBarrier(dd, fc.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL); // real frame -> present, untouched
+                VkImage spareImg = s.images[spareIdx];
+                imgBarrier(dd, fc.cmd, spareImg, VK_IMAGE_LAYOUT_UNDEFINED, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, ALL, TR);
+                dd.CmdBlitImage(fc.cmd, gt.img, TS, spareImg, TD, 1, &bl, VK_FILTER_NEAREST);      // generated -> spare image
+                imgBarrier(dd, fc.cmd, spareImg, TD, PS, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, ALL);
+                dd.EndCommandBuffer(fc.cmd);
+                // one submit, waits app render-finished + acquire, signals gen + real present sems
+                std::vector<VkSemaphore> waits(pPresentInfo->pWaitSemaphores, pPresentInfo->pWaitSemaphores + pPresentInfo->waitSemaphoreCount);
+                waits.push_back(fc.acquireSem);
+                std::vector<VkPipelineStageFlags> ws(waits.size(), ALL);
+                VkSemaphore sigs[2] = { fc.genSem, fc.currSem };
+                VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                su.waitSemaphoreCount = (uint32_t)waits.size(); su.pWaitSemaphores = waits.data(); su.pWaitDstStageMask = ws.data();
+                su.commandBufferCount = 1; su.pCommandBuffers = &fc.cmd;
+                su.signalSemaphoreCount = 2; su.pSignalSemaphores = sigs;
+                dd.QueueSubmit(st->queue, 1, &su, fc.fence); fc.submitted = true;
+                if (presents < 6) WFG_LOGI("2x insert live: spare=%u real=%u", spareIdx, idx);
+                presentOne(fc.genSem, spareIdx);            // generated (in-between) frame first
+                return presentOne(fc.currSem, idx);         // then the real frame
+            } else {
+                // no spare available -> fall back to 3a (blit generated over curr, single present)
+                imgBarrier(dd, fc.cmd, currImg, TS, TD, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, TR, TR);
+                dd.CmdBlitImage(fc.cmd, gt.img, TS, currImg, TD, 1, &bl, VK_FILTER_NEAREST);
+                imgBarrier(dd, fc.cmd, currImg, TD, PS, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, ALL);
+                dd.EndCommandBuffer(fc.cmd);
+                submitOne(fc.currSem);
+                return presentOne(fc.currSem, idx);
+            }
         }
     }
     return st->dd.QueuePresentKHR(queue, pPresentInfo);
