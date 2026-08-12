@@ -458,6 +458,13 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             uint32_t spareIdx = 0;
             VkResult ar = dd.AcquireNextImageKHR(dev, sc, 2000000ull, fc.acquireSem, VK_NULL_HANDLE, &spareIdx);
             bool insert = (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) && spareIdx < s.images.size();
+            // Diagnostic: 2x insert vs 3a blit-over fallback. If fallback climbs during
+            // motion, the spare-image acquire is starving -> every frame becomes the soft
+            // interpolated one -> blur (which a bg/fg swapchain recreate would reset).
+            { static unsigned long long nIns = 0, nFall = 0;
+              if (insert) ++nIns; else ++nFall;
+              if (((nIns + nFall) % 300ull) == 0)
+                  WFG_LOGI("present path: insert=%llu fallback=%llu (last acquire=%d)", nIns, nFall, (int)ar); }
 
             imgBarrier(dd, fc.cmd, currImg, PS, SR, 0, VK_ACCESS_SHADER_READ_BIT, ALL, CS);
             imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, CS);
