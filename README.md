@@ -1,4 +1,4 @@
-# win-fg
+# win-fg v0.1
 
 A clean-room, color-only frame-generation engine for Android/Vulkan (Turnip/
 Adreno) — the successor to models 3 & 4, rebuilt so **no part derives from the

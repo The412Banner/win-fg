@@ -6,7 +6,7 @@
         "library_path": "./libwin_fg.so",
         "api_version": "1.1.0",
         "implementation_version": "1",
-        "description": "win-fg clean-room frame generation (FSR3 optical flow + own synthesis)",
+        "description": "win-fg v0.1 — clean-room frame generation (FSR3 optical flow + own synthesis)",
         "library_arch": "64",
         "functions": {
             "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
