@@ -5,6 +5,11 @@ from. It exists so the licensing problem that took down the upstream bionic-fg
 project **cannot recur here**. If a change would violate a rule below, it does
 not go in.
 
+> **Verified current as of 2026-08-12** (through device bring-up: Vulkan host,
+> Phase 3a/3b frame insertion, perf + quality tuning). Every change since the
+> initial commit has been win-fg's own Vulkan/shader code or a published-math
+> reimplementation — **no new third-party or proprietary source has entered.**
+
 ## Background (why this repo exists)
 
 The upstream `bionic-fg` frame-generation layer, and the GameScope
@@ -33,10 +38,28 @@ independently-written one.
 | Occlusion-gated expand (m4) | `shaders/of3_expand_m4.comp` | our extension of the above | MIT (ours) |
 | **Interpolated-frame synthesis** | **`shaders/wfg_synth.comp`** | **written from first principles for win-fg** | **MIT (ours)** |
 
-`wfg_synth.comp` is textbook motion-compensated interpolation: bidirectional
-backward warp under a linear-motion assumption, linear temporal blend, and a
-confidence-gated cross-fade fallback. It was written from the algorithm, not
-from `shader_04`.
+`wfg_synth.comp` is motion-compensated interpolation, written from the algorithm
+(not from `shader_04`): bidirectional backward warp under a linear-motion
+assumption, an **importance-weighted (softmax) blend** of the two warped
+candidates, a **flow-magnitude clamp**, and a **photometric + forward/backward
+consistency gate** that cross-fades where the flow is unreliable. The math behind
+the importance blend, brightness-constancy residual and consistency gate is
+listed under "synthesis math" below — all reimplemented from published papers.
+
+## Host & tooling — all win-fg's own code
+
+Everything under `src/` and `tools/`, plus the build/manifest files, is win-fg's
+own code (the only external references are the permissively-licensed Vulkan-layer
+patterns listed in "Host layer sources" below — no code is copied from any
+frame-gen project):
+
+| Files | What |
+|---|---|
+| `src/layer.cpp` | Vulkan implicit layer: negotiation, dispatch, swapchain + present interception, frame insertion |
+| `src/framegen.{hpp,cpp}`, `src/record_impl.inc` | compute engine: pipelines, per-size resources, the flow→synth dispatch graph |
+| `src/vk_dispatch.hpp`, `src/config.hpp`, `src/log.hpp` | dispatch tables, runtime config/hot-reload, logging |
+| `src/embedded_shaders.hpp`, `tools/embed_spv.py` | generator + embedded SPIR-V of **our own** shaders only (no traced table) |
+| `CMakeLists.txt`, `manifest/…json`, `tools/build_shaders.sh`, `VERSION` | build, layer manifest, shader compile, version |
 
 ## What is DELIBERATELY EXCLUDED — never add these
 
