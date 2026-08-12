@@ -2,6 +2,13 @@
 // Included from framegen.cpp (has access to FrameGen privates). Written for
 // win-fg; standard Vulkan compute wiring, no third-party code.
 
+// Optical flow is solved only from this pyramid level down (0 = full res). Full-
+// res per-pixel SAD is far too expensive on mobile, so we solve at 1/4 res
+// (level 2) and let of3_expand bilinear-upscale to display resolution — the flow
+// vectors are already in full-res pixel units at every level. This is the single
+// biggest perf lever; raise for more detail, lower for more speed.
+static const int kFlowFinest = 2;
+
 namespace {
 struct ScratchState {
     // host-visible UBO buffers
@@ -14,6 +21,7 @@ struct ScratchState {
     VkDescriptorSet sExpand = VK_NULL_HANDLE, sSynth = VK_NULL_HANDLE;
     VkExtent2D builtFor{0,0};
     bool built = false;
+    bool flowInited = false;   // flow images laid out once, then persist (temporal predictor)
 };
 ScratchState g_scratch; // one swapchain in flight in this first-draft engine
 }
@@ -108,9 +116,15 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     // GENERAL, not UNDEFINED).
     for (auto& i : pyrA_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     for (auto& i : pyrB_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    for (auto& i : flowLvl_) barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cmd, flowExpA_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cmd, flowExpB_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    // Flow levels persist across frames (their prior value is the coarse-search
+    // predictor), so lay them out once and never discard them.
+    if (!g_scratch.flowInited) {
+        for (int l = kFlowFinest; l < kLevels; ++l)
+            barrier(cmd, flowLvl_[l].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        g_scratch.flowInited = true;
+    }
 
     // 1) luma of curr/prev at full res
     disp(pLuma_, g_scratch.sLumaCurr, levelExtent(extent_, 0));
@@ -122,12 +136,12 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
         disp(pDown_, g_scratch.sDownB[l - 1], levelExtent(extent_, l));
         bar(pyrA_[l]); bar(pyrB_[l]);
     }
-    // 3) coarse->fine flow
-    for (int l = kLevels - 1; l >= 0; --l) {
+    // 3) coarse->fine flow (only down to kFlowFinest — reduced res for perf)
+    for (int l = kLevels - 1; l >= kFlowFinest; --l) {
         disp(flowP, g_scratch.sFlow[l], levelExtent(extent_, l));
         bar(flowLvl_[l]);
     }
-    // 4) expand finest flow -> fwd/bwd (+conf)
+    // 4) expand finest solved flow -> fwd/bwd (+conf), bilinear-upscaled to full res
     disp(expandP, g_scratch.sExpand, levelExtent(extent_, 0));
     bar(flowExpA_); bar(flowExpB_);
     // 5) synthesise interpolated frame
@@ -189,7 +203,7 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
     // expand set (fixed)
     S.sExpand = allocSet(dd, dev, pool, pExpand.setLayout);
     wUbo(dd, dev, S.sExpand, 0, S.expandUbo, sizeof(FlowUBO));
-    wImg(dd, dev, S.sExpand, 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[0].view, samp, GEN);
+    wImg(dd, dev, S.sExpand, 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[kFlowFinest].view, samp, GEN);
     wImg(dd, dev, S.sExpand, 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expA.view, VK_NULL_HANDLE, GEN);
     wImg(dd, dev, S.sExpand, 49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expB.view, VK_NULL_HANDLE, GEN);
 
