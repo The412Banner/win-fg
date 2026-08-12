@@ -41,6 +41,7 @@ struct DeviceState {
     bool fgInited = false;
     std::string confPath;          // guest conf.toml, watched for live hot-reload
     long long confMtime = 0;
+    bool resetPrev = false;        // set on any conf change -> recapture prev frame
 };
 
 // Returns the conf.toml mtime (0 if absent).
@@ -370,6 +371,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                  nc.enabled, nc.multiplier, nc.model, nc.flowScale, st->cfg.enabled ? 1 : 0);
         st->cfg = nc;
         st->fg.configure(nc);
+        st->resetPrev = true;   // toggle/model/flow change -> recapture prev next frame
     }
 
     // Trace first present + every enabled-state transition so the in-game toggle is
@@ -398,6 +400,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             && idx < sit->second.images.size()) {
             SwapState& s = sit->second;
             GenTarget& gt = git->second;
+            if (st->resetPrev) { s.prevValid = false; st->resetPrev = false; }  // fresh prev on toggle
             const DeviceDispatch& dd = st->dd;
             VkDevice dev = st->device;
             FrameCtx& fc = s.ring[s.ringIdx];
