@@ -1,6 +1,6 @@
 # NOTICE — FidelityFX Optical Flow (model 3)
 
-bionic-fg "model 3" (FSR3 Optical Flow) embeds compute shaders that are an
+win-fg "model 3" (FSR3 Optical Flow) embeds compute shaders that are an
 adaptation of the **AMD FidelityFX SDK FSR3 Optical Flow** algorithm.
 
 Source passes adapted (FidelityFX-SDK, branch `main`):

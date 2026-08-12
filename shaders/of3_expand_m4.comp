@@ -1,13 +1,13 @@
 #version 450
 // ─────────────────────────────────────────────────────────────────────────────
-// bionic-fg model 4 — FSR3 Optical Flow v2 (pass 4/4): scale to full res + fwd/bwd.
+// win-fg model 4 — FSR3 Optical Flow v2 (pass 4/4): scale to full res + fwd/bwd.
 //
 // Adapted from AMD FidelityFX-SDK FSR3 Optical Flow scale pass:
 //   ffx_opticalflow_scale_optical_flow_advanced_v5.h (bilinear upscale of the
 //   coarse flow field to display resolution). FidelityFX SDK is MIT-licensed.
 //
-// Produces the two full-resolution flow images bionic-fg's existing warp/blend
-// (shader_14/20) and synthesis (shader_04) passes consume as flowExpA_/flowExpB_.
+// Produces the two full-resolution flow images win-fg's synthesis pass
+// (wfg_synth) consumes as flowExpA / flowExpB.
 //
 // ── Model 4: consistency gating replaces backward = -forward ─────────────────
 // of3_flow now solves the backward field independently (.zw) instead of

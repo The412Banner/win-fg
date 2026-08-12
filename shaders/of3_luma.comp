@@ -1,6 +1,6 @@
 #version 450
 // ─────────────────────────────────────────────────────────────────────────────
-// bionic-fg model 3 — FSR3 Optical Flow (pass 1/4): perceptual luma extract.
+// win-fg model 3 — FSR3 Optical Flow (pass 1/4): perceptual luma extract.
 //
 // Adapted from AMD FidelityFX-SDK FSR3 Optical Flow "PrepareLuma" pass:
 //   Kits/FidelityFX/framegeneration/fsr3/include/gpu/opticalflow/

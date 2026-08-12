@@ -1,6 +1,6 @@
 #version 450
 // ─────────────────────────────────────────────────────────────────────────────
-// bionic-fg model 3 — FSR3 Optical Flow (pass 2/4): luma pyramid downsample.
+// win-fg model 3 — FSR3 Optical Flow (pass 2/4): luma pyramid downsample.
 //
 // Adapted from AMD FidelityFX-SDK FSR3 Optical Flow luminance-pyramid pass:
 //   ffx_opticalflow_compute_luminance_pyramid.h  (SpdReduce4 == 0.25 box filter,

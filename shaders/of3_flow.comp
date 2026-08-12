@@ -1,6 +1,6 @@
 #version 450
 // ─────────────────────────────────────────────────────────────────────────────
-// bionic-fg model 3 — FSR3 Optical Flow (pass 3/4): coarse-to-fine block flow.
+// win-fg model 3 — FSR3 Optical Flow (pass 3/4): coarse-to-fine block flow.
 //
 // Adapted from AMD FidelityFX-SDK FSR3 Optical Flow search pass:
 //   ffx_opticalflow_compute_optical_flow_v5.h
