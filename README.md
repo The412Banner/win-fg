@@ -54,7 +54,7 @@ they run on Turnip without extended-format or subgroup features.
 - [x] All shaders compile Turnip-safe
 - [x] Vulkan implicit-layer host (weight-free): dispatch, swapchain, present hook, compute engine
 - [x] SPIR-V embed generator (no traced table)
-- [ ] CI compile → green (in progress)
+- [x] CI compile → green (NDK r27d, libwin_fg.so builds)
 - [ ] Device bring-up: frame insertion + sync (see docs/BRINGUP.md), resume `fg011-m34` tuning
 - [ ] Bundle into Bannerlator, retire the traced layer
 
