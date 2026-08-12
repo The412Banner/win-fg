@@ -70,7 +70,7 @@ void main() {
     // warp uses fs=1.0 and the generated frame is REPLACED with the raw solved
     // flow magnitude as brightness (normalised to the 10% clamp): white = flow is
     // saturating the clamp (warp will be wrong -> blur), grey = healthy motion.
-    bool  dbg = flowScale > 5.0;
+    bool  dbg = flowScale > 3.5;   // sentinel reachable within the [0.05,4.0] conf clamp
     float fs  = dbg ? 1.0 : flowScale;
 
     // Flow fields at this output pixel (px -> uv), scaled for tuning.
