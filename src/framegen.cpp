@@ -48,11 +48,11 @@ void FrameGen::destroyImage(Img& i) {
     i = Img{};
 }
 
-bool FrameGen::makePipe(Pipe& p, embedded::Shader shader,
+bool FrameGen::makePipe(Pipe& p, int shaderId,
                         const std::vector<VkDescriptorType>&) {
     // binding layout is derived per shader below in init(); here we only build
     // the module + a generic layout supplied by caller via setLayout already set.
-    embedded::Blob b = embedded::blob(shader);
+    embedded::Blob b = embedded::blob((embedded::Shader)shaderId);
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = b.words * 4; mi.pCode = b.code;
     VKOK(dd_->CreateShaderModule(device_, &mi, nullptr, &p.module));
@@ -180,7 +180,6 @@ void FrameGen::barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout from, VkI
 //   coarse->fine flow (per level) into flowLvl
 //   expand flowLvl[0] -> flowExpA/flowExpB
 //   synth(prev,curr,flowExpA,flowExpB, alpha) -> out
-#include "record_impl.inc"
 
 void FrameGen::destroy() {
     if (!device_) return;
@@ -197,3 +196,7 @@ void FrameGen::destroy() {
 }
 
 } // namespace winfg
+
+// record() + its scratch helpers reopen namespace winfg themselves, so include
+// this OUTSIDE the namespace block above (keeps FrameGen:: members attached).
+#include "record_impl.inc"

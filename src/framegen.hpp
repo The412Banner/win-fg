@@ -36,7 +36,7 @@ private:
     uint32_t findMemType(uint32_t bits, VkMemoryPropertyFlags props) const;
     bool makeImage(Img& out, VkExtent2D ext, VkFormat fmt, VkImageUsageFlags usage);
     void destroyImage(Img& i);
-    bool makePipe(Pipe& p, embedded::Shader shader,
+    bool makePipe(Pipe& p, int shaderId,
                   const std::vector<VkDescriptorType>& bindings);
     void destroyPipe(Pipe& p);
     void barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout from, VkImageLayout to);

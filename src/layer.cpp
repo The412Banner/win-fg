@@ -14,6 +14,11 @@
 
 using namespace winfg;
 
+// Khronos headers don't define this; layers declare their own export macro.
+#ifndef VK_LAYER_EXPORT
+#define VK_LAYER_EXPORT __attribute__((visibility("default")))
+#endif
+
 namespace {
 std::mutex g_lock;
 std::map<void*, InstanceDispatch> g_inst;
