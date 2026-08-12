@@ -10,8 +10,10 @@
 #include <map>
 #include <mutex>
 #include <vector>
+#include <string>
 #include <cstring>
 #include <cstdio>
+#include <sys/stat.h>
 
 using namespace winfg;
 
@@ -35,7 +37,16 @@ struct DeviceState {
     Config cfg;
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     bool fgInited = false;
+    std::string confPath;          // guest conf.toml, watched for live hot-reload
+    long long confMtime = 0;
 };
+
+// Returns the conf.toml mtime (0 if absent).
+static long long stat_mtime(const std::string& p) {
+    struct stat sb;
+    if (p.empty() || stat(p.c_str(), &sb) != 0) return 0;
+    return (long long)sb.st_mtime * 1000000000LL + (long long)sb.st_mtim.tv_nsec;
+}
 std::map<void*, DeviceState> g_dev;
 
 struct SwapState {
@@ -136,6 +147,8 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     void* ik = dispatch_key(phys);
     st.id = &g_inst[ik];
     st.cfg = load_config();
+    st.confPath = conf_path();
+    st.confMtime = stat_mtime(st.confPath);
     // pick a queue family with compute
     uint32_t qfc = 0; st.id->GetPhysicalDeviceQueueFamilyProperties(phys, &qfc, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qfc);
@@ -184,7 +197,10 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
     }
     WFG_LOGI("CreateSwapchain %ux%u fmt=%d images=%u (enabled=%d)",
              s.extent.width, s.extent.height, (int)s.format, n, st.cfg.enabled);
-    if (!st.fgInited && st.cfg.enabled) {
+    // Always initialise the compute engine when the layer is loaded (not gated on
+    // enabled), so the pipelines/pyramids build up-front and a live in-game enable
+    // has nothing left to set up. Proves the compute path on Turnip even while idle.
+    if (!st.fgInited) {
         bool ok = st.fg.init(&st.dd, st.id, st.phys, device, st.queueFamily, st.queue);
         st.fg.configure(st.cfg);
         st.fgInited = ok;
@@ -212,20 +228,35 @@ extern "C" void VKAPI_CALL winfg_DestroySwapchainKHR(VkDevice device, VkSwapchai
 // unchanged (safe passthrough). Inserting the generated frame as an extra
 // present (the actual 2x) is the device bring-up step — see docs/BRINGUP.md.
 extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
-    DeviceState* st = nullptr;
-    { std::lock_guard<std::mutex> lk(g_lock);
-      for (auto& kv : g_dev) if (dispatch_key(kv.first) == dispatch_key(queue)) { st = &kv.second; break; } }
-    if (!st || !st->cfg.enabled || !st->fgInited) {
-        // passthrough
-        std::lock_guard<std::mutex> lk(g_lock);
-        return g_dev[dispatch_key(queue)].dd.QueuePresentKHR(queue, pPresentInfo);
-    }
-    // NOTE: real generation/insert wired during device bring-up; passthrough now.
-    static unsigned long long presents = 0;
-    if (presents == 0) WFG_LOGI("first present — FG active (passthrough), fg.valid=%d", st->fg.valid());
-    else if ((presents % 600) == 0) WFG_LOGI("present #%llu (passthrough, fg.valid=%d)", presents, st->fg.valid());
-    ++presents;
     std::lock_guard<std::mutex> lk(g_lock);
+    DeviceState* st = nullptr;
+    for (auto& kv : g_dev) if (dispatch_key(kv.first) == dispatch_key(queue)) { st = &kv.second; break; }
+    if (!st) return g_dev[dispatch_key(queue)].dd.QueuePresentKHR(queue, pPresentInfo);
+
+    // Hot-reload conf.toml so the in-game controls (enable / multiplier / model /
+    // flow scale) reach the layer live. Cheap stat every present; only re-read the
+    // file when its mtime actually changes.
+    long long m = stat_mtime(st->confPath);
+    if (m != 0 && m != st->confMtime) {
+        st->confMtime = m;
+        Config nc = load_config();
+        WFG_LOGI("conf reload: enabled=%d mult=%d model=%d flow=%.2f (was enabled=%d)",
+                 nc.enabled, nc.multiplier, nc.model, nc.flowScale, st->cfg.enabled ? 1 : 0);
+        st->cfg = nc;
+        st->fg.configure(nc);
+    }
+
+    // Trace first present + every enabled-state transition so the in-game toggle is
+    // visible in logcat. Generation/insertion is Phase 3 — passthrough for now.
+    static unsigned long long presents = 0;
+    static int lastEnabled = -1;
+    int en = st->cfg.enabled ? 1 : 0;
+    if (presents == 0 || en != lastEnabled) {
+        WFG_LOGI("present #%llu enabled=%d mult=%d fg.valid=%d (passthrough — insertion is Phase 3)",
+                 presents, en, st->cfg.multiplier, st->fg.valid());
+        lastEnabled = en;
+    }
+    ++presents;
     return st->dd.QueuePresentKHR(queue, pPresentInfo);
 }
 

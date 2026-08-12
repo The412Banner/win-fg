@@ -61,6 +61,13 @@ static inline void apply_toml(Config& c, const std::string& path) {
     }
 }
 
+// Path of the conf.toml the app writes (used for hot-reload mtime checks).
+static inline std::string conf_path() {
+    if (const char* p = std::getenv("WIN_FG_CONF")) return p;
+    const char* home = std::getenv("HOME");
+    return home ? std::string(home) + "/.config/win-fg/conf.toml" : std::string();
+}
+
 // env defaults first, then conf.toml overrides (file wins when present).
 static inline Config load_config() {
     Config c;
