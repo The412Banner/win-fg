@@ -5,6 +5,7 @@
 #include "vk_dispatch.hpp"
 #include "framegen.hpp"
 #include "config.hpp"
+#include "log.hpp"
 #include <vulkan/vk_layer.h>
 #include <map>
 #include <mutex>
@@ -78,6 +79,7 @@ extern "C" VkResult VKAPI_CALL winfg_CreateInstance(
     std::lock_guard<std::mutex> lk(g_lock);
     g_inst[dispatch_key(*pInstance)] = d;
     g_instHandle[dispatch_key(*pInstance)] = *pInstance;
+    WFG_LOGI("CreateInstance ok — win-fg layer in the chain");
     return VK_SUCCESS;
 }
 
@@ -141,7 +143,9 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     for (uint32_t i = 0; i < qfc; ++i) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { st.queueFamily = i; break; }
     dd.GetDeviceQueue(*pDevice, st.queueFamily, 0, &st.queue);
     g_dev[dispatch_key(*pDevice)] = std::move(st);
-    std::fprintf(stderr, "[win-fg] device created (enable=%d model=%d)\n", g_dev[dispatch_key(*pDevice)].cfg.enabled, g_dev[dispatch_key(*pDevice)].cfg.model);
+    auto& ds = g_dev[dispatch_key(*pDevice)];
+    WFG_LOGI("CreateDevice ok (enable=%d model=%d mult=%d flowScale=%.2f computeQF=%u)",
+             ds.cfg.enabled, ds.cfg.model, ds.cfg.multiplier, ds.cfg.flowScale, ds.queueFamily);
     return VK_SUCCESS;
 }
 
@@ -178,12 +182,18 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         st.dd.CreateImageView(device, &vi, nullptr, &s.views[i]);
     }
+    WFG_LOGI("CreateSwapchain %ux%u fmt=%d images=%u (enabled=%d)",
+             s.extent.width, s.extent.height, (int)s.format, n, st.cfg.enabled);
     if (!st.fgInited && st.cfg.enabled) {
-        st.fg.init(&st.dd, st.id, st.phys, device, st.queueFamily, st.queue);
+        bool ok = st.fg.init(&st.dd, st.id, st.phys, device, st.queueFamily, st.queue);
         st.fg.configure(st.cfg);
-        st.fgInited = true;
+        st.fgInited = ok;
+        if (!ok) WFG_LOGE("framegen init FAILED — FG will not run this swapchain");
     }
-    if (st.fgInited) st.fg.onResize(s.extent, s.format);
+    if (st.fgInited) {
+        if (!st.fg.onResize(s.extent, s.format))
+            WFG_LOGE("framegen onResize FAILED for %ux%u", s.extent.width, s.extent.height);
+    }
     g_swap[*pSwapchain] = std::move(s);
     return VK_SUCCESS;
 }
@@ -211,6 +221,10 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
         return g_dev[dispatch_key(queue)].dd.QueuePresentKHR(queue, pPresentInfo);
     }
     // NOTE: real generation/insert wired during device bring-up; passthrough now.
+    static unsigned long long presents = 0;
+    if (presents == 0) WFG_LOGI("first present — FG active (passthrough), fg.valid=%d", st->fg.valid());
+    else if ((presents % 600) == 0) WFG_LOGI("present #%llu (passthrough, fg.valid=%d)", presents, st->fg.valid());
+    ++presents;
     std::lock_guard<std::mutex> lk(g_lock);
     return st->dd.QueuePresentKHR(queue, pPresentInfo);
 }

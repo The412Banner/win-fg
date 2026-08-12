@@ -1,12 +1,13 @@
 // win-fg — compute frame-generation engine implementation.
 #include "framegen.hpp"
 #include "embedded_shaders.hpp"
+#include "log.hpp"
 #include <cmath>
 #include <cstdio>
 
 namespace winfg {
 
-#define VKOK(x) do { if ((x) != VK_SUCCESS) { std::fprintf(stderr, "[win-fg] fail %s\n", #x); return false; } } while (0)
+#define VKOK(x) do { if ((x) != VK_SUCCESS) { WFG_LOGE("vk fail: %s", #x); return false; } } while (0)
 
 uint32_t FrameGen::findMemType(uint32_t bits, VkMemoryPropertyFlags props) const {
     for (uint32_t i = 0; i < memProps_.memoryTypeCount; ++i)
@@ -131,6 +132,7 @@ bool FrameGen::init(const DeviceDispatch* dd, const InstanceDispatch* id,
     if (!makePipe(pExpand_,   embedded::OF3_EXPAND, unused)) return false;
     if (!makePipe(pExpandM4_, embedded::OF3_EXPAND_M4, unused)) return false;
     if (!makePipe(pSynth_,    embedded::WFG_SYNTH, unused)) return false;
+    WFG_LOGI("framegen init ok (queueFamily=%u, 7 pipelines, model=%d)", queueFamily_, cfg_.model);
     return true;
 }
 
@@ -159,6 +161,7 @@ bool FrameGen::onResize(VkExtent2D extent, VkFormat /*colorFormat*/) {
     if (!makeImage(flowExpA_, extent, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
     if (!makeImage(flowExpB_, extent, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
     ready_ = true;
+    WFG_LOGI("framegen resized to %ux%u (%d pyramid levels)", extent.width, extent.height, kLevels);
     return true;
 }
 
