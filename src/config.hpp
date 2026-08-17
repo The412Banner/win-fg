@@ -21,6 +21,16 @@ struct Config {
     float    lambda      = 0.6f;   // FB-consistency vs photometric weight
     float    epsilon     = 0.05f;  // disocclusion floor
     float    photoScale  = 6.0f;   // photometric residual scale into Z
+    // HUD exclusion rect in pixel coords (x0,y0,x1,y1). Fragments inside are
+    // passed through as the real current frame (no warp, no synth) so text /
+    // overlays don't ghost. Disabled when x0 >= x1 or y0 >= y1 (the default).
+    // Sourced from WIN_FG_HUD_RECT="x0,y0,x1,y1" env var or conf.toml
+    // (hudRect="x0,y0,x1,y1"). Pattern is Isygold's Vegas DXVK framegen —
+    // host knows where the HUD is, tell the shader to skip it.
+    float    hudX0       = 0.0f;
+    float    hudY0       = 0.0f;
+    float    hudX1       = 0.0f;
+    float    hudY1       = 0.0f;
 
     void sanitize() {
         if (model < 3) model = 3; if (model > 4) model = 4;
@@ -58,6 +68,19 @@ static inline void apply_toml(Config& c, const std::string& path) {
         else if (k == "lambda")     c.lambda = std::strtof(v.c_str(), nullptr);
         else if (k == "epsilon")    c.epsilon = std::strtof(v.c_str(), nullptr);
         else if (k == "photoScale") c.photoScale = std::strtof(v.c_str(), nullptr);
+        else if (k == "hudRect") {
+            // "x0,y0,x1,y1" in pixel coords
+            float r[4] = {0,0,0,0}; int n = 0;
+            size_t start = 0; std::string s = v;
+            for (; n < 4; ++n) {
+                size_t comma = s.find(',', start);
+                std::string tok = s.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                r[n] = std::strtof(tok.c_str(), nullptr);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+            c.hudX0 = r[0]; c.hudY0 = r[1]; c.hudX1 = r[2]; c.hudY1 = r[3];
+        }
     }
 }
 
@@ -79,6 +102,18 @@ static inline Config load_config() {
     c.lambda     = envf("WIN_FG_LAMBDA", c.lambda);
     c.epsilon    = envf("WIN_FG_EPSILON", c.epsilon);
     c.photoScale = envf("WIN_FG_PHOTOSCALE", c.photoScale);
+    if (const char* h = std::getenv("WIN_FG_HUD_RECT")) {
+        // "x0,y0,x1,y1" — pixel coords; disabled when x0>=x1 or y0>=y1
+        float r[4] = {0,0,0,0}; int n = 0;
+        std::string s = h; size_t start = 0;
+        for (; n < 4; ++n) {
+            size_t comma = s.find(',', start);
+            r[n] = std::strtof(s.substr(start, comma == std::string::npos ? std::string::npos : comma - start).c_str(), nullptr);
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        c.hudX0 = r[0]; c.hudY0 = r[1]; c.hudX1 = r[2]; c.hudY1 = r[3];
+    }
     const char* home = std::getenv("HOME");
     if (home) apply_toml(c, std::string(home) + "/.config/win-fg/conf.toml");
     if (const char* p = std::getenv("WIN_FG_CONF")) apply_toml(c, p);
@@ -86,9 +121,12 @@ static inline Config load_config() {
     return c;
 }
 
-// UBO layout — MUST match wfg_synth.comp binding 0 (8 floats).
+// UBO layout — MUST match wfg_synth.comp binding 0.
+// The vec4 hudRect is 16-byte aligned in std140, sits at offset 32 (after the
+// 8 leading floats which naturally occupy 32B). Disabled when hudX0>=hudX1.
 struct SynthUBO {
     float flowScale, alpha, beta, lambda, epsilon, photoScale, pad0, pad1;
+    float hudX0, hudY0, hudX1, hudY1;
 };
 // UBO layout — MUST match of3_flow / of3_expand_m4 binding 0 (Model3UBO).
 struct FlowUBO { float flowScale; uint32_t level; float occlLo; float occlHi; };

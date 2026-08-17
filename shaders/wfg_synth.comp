@@ -45,6 +45,9 @@ layout(binding = 0) uniform U {
     float epsilon;     // floor below which both candidates are "disoccluded"
     float photoScale;  // scales the photometric residual into Z
     float pad0; float pad1;
+    vec4  hudRect;     // pixel coords (x0,y0,x1,y1); disabled when x0>=x1.
+                        // fragments inside are written verbatim from uCurr so
+                        // HUD/text doesn't get warped by flow (Isygold pattern).
 };
 
 layout(binding = 32) uniform sampler2D uPrev;      // I0
@@ -64,6 +67,18 @@ void main() {
 
     vec2 invDim = 1.0 / vec2(dim);
     vec2 uv = (vec2(gid) + 0.5) * invDim;
+
+    // HUD exclusion: if this pixel is inside the host-supplied HUD rect,
+    // write the real current frame verbatim and skip all flow/warp work.
+    // Kills ghosting on text/overlays at the source. 16x16 workgroups are
+    // mostly all-inside or all-outside for any reasonable HUD rect, so the
+    // divergent early-out stays warp-coherent on Adreno.
+    if (hudRect.x < hudRect.z && hudRect.y < hudRect.w
+        && float(gid.x) >= hudRect.x && float(gid.x) < hudRect.z
+        && float(gid.y) >= hudRect.y && float(gid.y) < hudRect.w) {
+        imageStore(uOut, gid, vec4(texture(uCurr, uv).rgb, 1.0));
+        return;
+    }
 
     // DEBUG flow visualiser: gated on flowScale>5 (an out-of-range sentinel set
     // live via conf.toml) so we can flip it on/off with no rebuild. When on, the
