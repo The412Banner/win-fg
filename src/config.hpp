@@ -19,8 +19,14 @@ struct Config {
     // synthesis (wfg_synth) tuning
     float    beta        = 8.0f;   // softmax sharpness on importance Z
     float    lambda      = 0.6f;   // FB-consistency vs photometric weight
-    float    epsilon     = 0.05f;  // disocclusion floor
-    float    photoScale  = 6.0f;   // photometric residual scale into Z
+    // Tightened 2026-08-17 to prioritise "no ghost" over max sharpness — the
+    // remaining single-frame ghosts came from pixels that the previous defaults
+    // still trusted with warp when they should have cross-faded. Raising both
+    // pushes borderline pixels toward the safe cross-fade path (softer, but no
+    // smear). Prewarp will lift the ceiling further; this is the "safety net"
+    // knob change until then.
+    float    epsilon     = 0.10f;  // disocclusion floor (was 0.05)
+    float    photoScale  = 9.0f;   // photometric residual scale into Z (was 6.0)
     // HUD exclusion rect in pixel coords (x0,y0,x1,y1). Fragments inside are
     // passed through as the real current frame (no warp, no synth) so text /
     // overlays don't ghost. Disabled when x0 >= x1 or y0 >= y1 (the default).
