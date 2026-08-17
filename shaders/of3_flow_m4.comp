@@ -95,8 +95,25 @@ vec2 solve(sampler2D a, sampler2D b, vec2 pred) {
         }
     }
 
-    // Sub-pixel refinement dropped for perf (was 4 extra block-SAD taps/solve).
-    // Model 4's value is the bidirectional occlusion signal, not sub-pixel.
+    // Sub-pixel refinement at level 0 only. Parabola fit on the 5-cell cross of
+    // SAD values around the integer winner in each axis (Lowe 2004 §5, RAFT
+    // arxiv:2003.12039 §3.2 lookup). 4 extra block-SADs — negligible vs the
+    // SR^2 loop and only fires once per direction at the finest pyramid level.
+    // Delta clamped to +-0.5 so a degenerate fit stays in-cell.
+    // Trades a small perf hit for measurably crisper synth on smooth pans.
+    if (level == 0u) {
+        float sadC  = bestSad - 0.0; // includes the smoothness bias; ratio cancels
+        float sadXm = blockSad(a, b, bestDisp + vec2(-1.0, 0.0)) + 0.002;
+        float sadXp = blockSad(a, b, bestDisp + vec2(+1.0, 0.0)) + 0.002;
+        float sadYm = blockSad(a, b, bestDisp + vec2(0.0, -1.0)) + 0.002;
+        float sadYp = blockSad(a, b, bestDisp + vec2(0.0, +1.0)) + 0.002;
+        float dx = 0.0, dy = 0.0;
+        float denomX = sadXm - 2.0 * sadC + sadXp;
+        float denomY = sadYm - 2.0 * sadC + sadYp;
+        if (denomX > 1e-6) dx = clamp(0.5 * (sadXm - sadXp) / denomX, -0.5, 0.5);
+        if (denomY > 1e-6) dy = clamp(0.5 * (sadYm - sadYp) / denomY, -0.5, 0.5);
+        bestDisp += vec2(dx, dy);
+    }
     return bestDisp;
 }
 
