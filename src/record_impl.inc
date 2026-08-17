@@ -93,7 +93,8 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     }
 
     // update UBOs for this frame
-    SynthUBO su{cfg_.flowScale, alpha, cfg_.beta, cfg_.lambda, cfg_.epsilon, cfg_.photoScale, 0, 0};
+    SynthUBO su{cfg_.flowScale, alpha, cfg_.beta, cfg_.lambda, cfg_.epsilon, cfg_.photoScale, 0, 0,
+                cfg_.hudX0, cfg_.hudY0, cfg_.hudX1, cfg_.hudY1};
     if (g_scratch.synthUboPtr) std::memcpy(g_scratch.synthUboPtr, &su, sizeof(su));
 
     // wire per-frame external views
