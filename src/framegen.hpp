@@ -59,7 +59,13 @@ private:
     Pipe pLuma_, pDown_, pFlow_, pFlowM4_, pExpand_, pExpandM4_, pSynth_;
 
     // per-resolution resources
-    static const int kLevels = 5;
+    // 7 levels (was 5): the coarsest levels set the max motion the solver can track.
+    // At 5 levels the reach was only ~±84px/frame at 720p, so fast camera motion
+    // (150-300px/frame at the periphery) saturated the search -> incoherent vectors
+    // -> oil-paint melt. Two more (tiny) coarse levels push the reach to ~±300px so
+    // large global motion is captured coherently instead of smeared. Near-zero cost:
+    // the extra levels are 40x22 and 20x11 images.
+    static const int kLevels = 7;
     std::vector<Img> pyrA_, pyrB_;   // luma pyramids for curr / prev
     std::vector<Img> flowLvl_;       // per-level flow scratch
     Img flowExpA_, flowExpB_;        // fwd / bwd expanded flow (+conf)

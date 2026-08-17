@@ -84,6 +84,7 @@ struct DeviceDispatch {
     PFN_vkCmdPipelineBarrier           CmdPipelineBarrier = nullptr;
     PFN_vkCmdCopyImage                 CmdCopyImage = nullptr;
     PFN_vkCmdBlitImage                 CmdBlitImage = nullptr;
+    PFN_vkCmdClearColorImage           CmdClearColorImage = nullptr;
     PFN_vkCreateFence                  CreateFence = nullptr;
     PFN_vkDestroyFence                 DestroyFence = nullptr;
     PFN_vkWaitForFences                WaitForFences = nullptr;

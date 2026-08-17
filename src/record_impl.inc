@@ -2,6 +2,13 @@
 // Included from framegen.cpp (has access to FrameGen privates). Written for
 // win-fg; standard Vulkan compute wiring, no third-party code.
 
+// Optical flow is solved only from this pyramid level down (0 = full res). Full-
+// res per-pixel SAD is far too expensive on mobile, so we solve at 1/4 res
+// (level 2) and let of3_expand bilinear-upscale to display resolution — the flow
+// vectors are already in full-res pixel units at every level. This is the single
+// biggest perf lever; raise for more detail, lower for more speed.
+static const int kFlowFinest = 2;
+
 namespace {
 struct ScratchState {
     // host-visible UBO buffers
@@ -14,6 +21,7 @@ struct ScratchState {
     VkDescriptorSet sExpand = VK_NULL_HANDLE, sSynth = VK_NULL_HANDLE;
     VkExtent2D builtFor{0,0};
     bool built = false;
+    bool flowInited = false;   // flow images laid out once, then persist (temporal predictor)
 };
 ScratchState g_scratch; // one swapchain in flight in this first-draft engine
 }
@@ -102,6 +110,36 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     };
     auto bar = [&](FrameGen::Img& i){ barrier(cmd, i.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL); };
 
+    // Internal images are created UNDEFINED and fully recomputed every frame, so
+    // discard-transition them all to GENERAL up front (all descriptors use GENERAL
+    // for these). This also fixes the first-frame layout (storage writes require
+    // GENERAL, not UNDEFINED).
+    for (auto& i : pyrA_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    for (auto& i : pyrB_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cmd, flowExpA_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cmd, flowExpB_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    // Reset the flow field to zero every frame. The coarsest level uses it as its
+    // search predictor; carrying it across frames lets a spurious vector feed
+    // forward until it diverges and melts the image (the bg/fg pause was resetting
+    // it — that's why artifacts vanished on resume). Fresh zero every frame =
+    // stable, standard pyramid flow, no feedback loop.
+    {
+        VkClearColorValue zero{};
+        VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        for (int l = kFlowFinest; l < kLevels; ++l) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.image = flowLvl_[l].image; b.subresourceRange = rng;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            dd_->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            dd_->CmdClearColorImage(cmd, flowLvl_[l].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &rng);
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            dd_->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+        }
+    }
+
     // 1) luma of curr/prev at full res
     disp(pLuma_, g_scratch.sLumaCurr, levelExtent(extent_, 0));
     disp(pLuma_, g_scratch.sLumaPrev, levelExtent(extent_, 0));
@@ -112,12 +150,12 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
         disp(pDown_, g_scratch.sDownB[l - 1], levelExtent(extent_, l));
         bar(pyrA_[l]); bar(pyrB_[l]);
     }
-    // 3) coarse->fine flow
-    for (int l = kLevels - 1; l >= 0; --l) {
+    // 3) coarse->fine flow (only down to kFlowFinest — reduced res for perf)
+    for (int l = kLevels - 1; l >= kFlowFinest; --l) {
         disp(flowP, g_scratch.sFlow[l], levelExtent(extent_, l));
         bar(flowLvl_[l]);
     }
-    // 4) expand finest flow -> fwd/bwd (+conf)
+    // 4) expand finest solved flow -> fwd/bwd (+conf), bilinear-upscaled to full res
     disp(expandP, g_scratch.sExpand, levelExtent(extent_, 0));
     bar(flowExpA_); bar(flowExpB_);
     // 5) synthesise interpolated frame
@@ -179,15 +217,18 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
     // expand set (fixed)
     S.sExpand = allocSet(dd, dev, pool, pExpand.setLayout);
     wUbo(dd, dev, S.sExpand, 0, S.expandUbo, sizeof(FlowUBO));
-    wImg(dd, dev, S.sExpand, 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[0].view, samp, GEN);
+    wImg(dd, dev, S.sExpand, 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[kFlowFinest].view, samp, GEN);
     wImg(dd, dev, S.sExpand, 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expA.view, VK_NULL_HANDLE, GEN);
     wImg(dd, dev, S.sExpand, 49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expB.view, VK_NULL_HANDLE, GEN);
 
     // synth set: external prev/curr/out wired per frame; flow inputs fixed
     S.sSynth = allocSet(dd, dev, pool, pSynth.setLayout);
     wUbo(dd, dev, S.sSynth, 0, S.synthUbo, sizeof(SynthUBO));
-    wImg(dd, dev, S.sSynth, 34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, expA.view, samp, SR);
-    wImg(dd, dev, S.sSynth, 35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, expB.view, samp, SR);
+    // GENERAL (not SR): these internal flow images stay in GENERAL across the whole
+    // record() (written as storage by expand, sampled here) — see the discard
+    // transition at the top of record().
+    wImg(dd, dev, S.sSynth, 34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, expA.view, samp, GEN);
+    wImg(dd, dev, S.sSynth, 35, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, expB.view, samp, GEN);
 
     S.builtFor = ext; S.built = true;
     return true;

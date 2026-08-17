@@ -51,7 +51,7 @@ layout(binding = 34) uniform sampler2D uPredictor; // coarser flow, full-res px 
 
 layout(binding = 48, rgba16f) uniform writeonly image2D uFlow; // .xy fwd, .zw bwd (full-res px)
 
-const int BR = 2; // block half-window  -> (2*BR+1)^2 = 25 tap SAD
+const int BR = 1; // block half-window  -> (2*BR+1)^2 = 9 tap SAD (trimmed from 5x5 for perf)
 const int SR = 3; // search radius      -> (2*SR+1)^2 = 49 candidates per level
 
 // Coarse-to-fine reach over 5 levels is +-SR*(1+2+4+8+16) = +-93 full-res px, so
@@ -95,19 +95,9 @@ vec2 solve(sampler2D a, sampler2D b, vec2 pred) {
         }
     }
 
-    // Sub-pixel: parabola through (best-1, best, best+1) per axis. Only valid
-    // when the centre really is a minimum, hence the denominator guard.
-    float sxm = blockSad(a, b, bestDisp + vec2(-1.0, 0.0));
-    float sxp = blockSad(a, b, bestDisp + vec2( 1.0, 0.0));
-    float sym = blockSad(a, b, bestDisp + vec2(0.0, -1.0));
-    float syp = blockSad(a, b, bestDisp + vec2(0.0,  1.0));
-
-    float dxDen = sxm + sxp - 2.0 * bestSad;
-    float dyDen = sym + syp - 2.0 * bestSad;
-    float dx = (dxDen > 1e-6) ? clamp(0.5 * (sxm - sxp) / dxDen, -0.5, 0.5) : 0.0;
-    float dy = (dyDen > 1e-6) ? clamp(0.5 * (sym - syp) / dyDen, -0.5, 0.5) : 0.0;
-
-    return bestDisp + vec2(dx, dy);
+    // Sub-pixel refinement dropped for perf (was 4 extra block-SAD taps/solve).
+    // Model 4's value is the bidirectional occlusion signal, not sub-pixel.
+    return bestDisp;
 }
 
 void main() {

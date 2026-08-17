@@ -68,9 +68,11 @@ void main() {
                     sad += abs(p - c);
                 }
             }
-            // Mild bias toward the predictor (smoothness prior, like the SDK's
-            // prediction term) so textureless regions keep the coarse flow.
-            sad += 0.002 * (abs(float(sx)) + abs(float(sy)));
+            // Bias toward the predictor (smoothness prior, like the SDK's prediction
+            // term) so textureless/ambiguous regions keep the coarse coherent flow
+            // instead of latching onto a spurious equal-cost match (a big source of
+            // the incoherent-vector melt). Raised from 0.002 -> 0.006.
+            sad += 0.006 * (abs(float(sx)) + abs(float(sy)));
             if (sad < bestSad) {
                 bestSad = sad;
                 bestDisp = cand;
