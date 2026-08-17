@@ -41,13 +41,40 @@ layout(binding = 32) uniform sampler2D uFlowFine;             // finest solved f
 layout(binding = 48, rgba16f) uniform writeonly image2D uFwd; // -> flowExpA_
 layout(binding = 49, rgba16f) uniform writeonly image2D uBwd; // -> flowExpB_
 
+// Median-of-5 via sorting network — 9 min/max. Strips isolated outlier flow
+// vectors before upscale (same rationale as of3_expand's medianized version).
+float med5(float a, float b, float c, float d, float e) {
+    float x, y;
+    x = min(a,b); a = max(a,b); b = x;
+    x = min(c,d); c = max(c,d); d = x;
+    x = min(a,c); a = max(a,c); c = x;
+    x = min(b,d); b = max(b,d); d = x;
+    x = min(b,c); b = max(b,c); c = x;
+    y = min(b, e); x = max(b, e);
+    return min(max(y, c), x);
+}
+
 void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dim = imageSize(uFwd);
     if (gid.x >= dim.x || gid.y >= dim.y) return;
 
     vec2 uv = (vec2(gid) + 0.5) / vec2(dim);
-    vec4 f  = textureLod(uFlowFine, uv, 0.0); // full-res pixel flow, bilinear-upsampled
+
+    // 5-tap median cross on the input flow field (offset = one input-texel).
+    // Applied per-component to .xy (fwd) and .zw (bwd) independently — kills
+    // speckle outliers on both directions before consistency gating below.
+    vec2 fs = 1.0 / vec2(textureSize(uFlowFine, 0));
+    vec4 c4 = textureLod(uFlowFine, uv,                    0.0);
+    vec4 xm = textureLod(uFlowFine, uv - vec2(fs.x, 0.0), 0.0);
+    vec4 xp = textureLod(uFlowFine, uv + vec2(fs.x, 0.0), 0.0);
+    vec4 ym = textureLod(uFlowFine, uv - vec2(0.0, fs.y), 0.0);
+    vec4 yp = textureLod(uFlowFine, uv + vec2(0.0, fs.y), 0.0);
+    vec4 f  = vec4(
+        med5(c4.x, xm.x, xp.x, ym.x, yp.x),
+        med5(c4.y, xm.y, xp.y, ym.y, yp.y),
+        med5(c4.z, xm.z, xp.z, ym.z, yp.z),
+        med5(c4.w, xm.w, xp.w, ym.w, yp.w));
     vec2 fwd = f.xy;
     vec2 bwd = f.zw;
 

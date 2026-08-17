@@ -28,13 +28,48 @@ layout(binding = 32) uniform sampler2D uFlowFine;            // finest solved fl
 layout(binding = 48, rgba16f) uniform writeonly image2D uFwd; // -> flowExpA_
 layout(binding = 49, rgba16f) uniform writeonly image2D uBwd; // -> flowExpB_
 
+// median of 5 floats via sorting network — 9 min/max, standard reference. Used
+// per-axis on the 5-tap flow cross below. Purpose: strip isolated outlier flow
+// vectors (single-block SAD hiccups on textureless regions) before they melt
+// the synth. Not a smoothness filter (unlike Gaussian): edges through the flow
+// field survive intact.
+float med5(float a, float b, float c, float d, float e) {
+    float x, y;
+    // sort a,b
+    x = min(a,b); a = max(a,b); b = x;
+    // sort c,d
+    x = min(c,d); c = max(c,d); d = x;
+    // sort a,c and b,d
+    x = min(a,c); a = max(a,c); c = x;
+    x = min(b,d); b = max(b,d); d = x;
+    // sort b,c
+    x = min(b,c); b = max(b,c); c = x;
+    // insert e; median of the middle three (b,c,e sorted) is the answer
+    y = min(b, e); x = max(b, e);
+    return min(max(y, c), x);
+}
+
 void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
     ivec2 dim = imageSize(uFwd);
     if (gid.x >= dim.x || gid.y >= dim.y) return;
 
     vec2 uv = (vec2(gid) + 0.5) / vec2(dim);
-    vec2 d = textureLod(uFlowFine, uv, 0.0).xy; // full-res pixel flow (curr->prev)
+
+    // 5-tap median cross on the input flow field. Offsets are one input-texel
+    // wide so neighbours are distinct flow cells (input res is 1/4 output res
+    // when kFlowFinest=2, so the cross spans one flow tile in each direction).
+    // Kills speckle outliers that produce the crawling / melting look during
+    // smooth pans, without the softening that a Gaussian would introduce.
+    // Cost: 5 flow reads + 2 med5 (18 min/max) per output pixel, negligible.
+    vec2 fs = 1.0 / vec2(textureSize(uFlowFine, 0));
+    vec2 c  = textureLod(uFlowFine, uv,                    0.0).xy;
+    vec2 xm = textureLod(uFlowFine, uv - vec2(fs.x, 0.0), 0.0).xy;
+    vec2 xp = textureLod(uFlowFine, uv + vec2(fs.x, 0.0), 0.0).xy;
+    vec2 ym = textureLod(uFlowFine, uv - vec2(0.0, fs.y), 0.0).xy;
+    vec2 yp = textureLod(uFlowFine, uv + vec2(0.0, fs.y), 0.0).xy;
+    vec2 d = vec2(med5(c.x, xm.x, xp.x, ym.x, yp.x),
+                  med5(c.y, xm.y, xp.y, ym.y, yp.y));
 
     imageStore(uFwd, gid, vec4( d, 0.0, 1.0));
     imageStore(uBwd, gid, vec4(-d, 0.0, 1.0));
