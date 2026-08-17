@@ -57,7 +57,7 @@ building blocks if we ever ship a learned model:
   RIFE-lite ourselves in raw Vulkan without depending on NCNN as a
   runtime.**
 
-### Snapdragon GSR — `SnapdragonStudios/snapdragon-gsr` (BSD-3-Clause, Qualcomm)
+### Snapdragon GSR — `SnapdragonGameStudios/snapdragon-gsr` (BSD-3-Clause, Qualcomm)
 
 - `sgsr/v2/include/glsl_2_pass_cs/sgsr2_convert.comp` + `sgsr2_upscale.comp` (2-pass compute)
 - `sgsr/v2/include/glsl_3_pass_cs/sgsr2_{activate,convert,upscale}.comp` (3-pass compute)
@@ -108,7 +108,7 @@ Rust reimpl in progress; **no shaders yet**. Placeholder to watch.
 - [FidelityFX-SDK main (FSR3.1)](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/main)
 - [rife-ncnn-vulkan (nihui)](https://github.com/nihui/rife-ncnn-vulkan)
 - [Tencent/ncnn Vulkan layer shaders](https://github.com/Tencent/ncnn/tree/master/src/layer/vulkan/shader)
-- [SnapdragonStudios/snapdragon-gsr](https://github.com/SnapdragonStudios/snapdragon-gsr)
+- [SnapdragonGameStudios/snapdragon-gsr](https://github.com/SnapdragonGameStudios/snapdragon-gsr)
 - [Z1xus/open-svpflow](https://github.com/Z1xus/open-svpflow)
 - [HopperLogger/HopperRender (GPL — reference only)](https://github.com/HopperLogger/HopperRender)
 - [HopperLogger/mpv-frame-interpolator (GPL — reference only)](https://github.com/HopperLogger/mpv-frame-interpolator)

@@ -1,64 +1,104 @@
-# win-fg v0.1
+# win-fg
 
-A clean-room, color-only frame-generation engine for Android/Vulkan (Turnip/
-Adreno) — the successor to models 3 & 4, rebuilt so **no part derives from the
-proprietary Lossless Scaling weights**. See [docs/PROVENANCE.md](docs/PROVENANCE.md)
-for the clean-room boundary; that document governs what may enter this repo.
+**Smart Adaptive Neural Frame Generation for Vulkan.**
+Clean-room, self-tuning, content-adaptive frame synthesis for Android
+emulation (Winlator / Wine on Adreno).
 
-## What it does
+> **Status: pre-alpha, private repo.** Not yet ready to ship; will go public
+> when the classical adaptive path (Phase 1) hits its success gates. See
+> [`docs/research/SANFG.md`](docs/research/SANFG.md) for the endgame and
+> [`docs/research/ROADMAP.md`](docs/research/ROADMAP.md) for the branch plan.
 
-Generates an in-between frame from two real frames to raise perceived frame
-rate. Two stages, both ours:
+## What this is
 
-1. **Optical flow** (`of3_*`) — our MIT adaptation of AMD FidelityFX FSR3
-   optical flow, subgroup-free for Turnip. Produces two full-resolution flow
-   fields with a confidence channel.
-2. **Synthesis** (`wfg_synth`) — written from first principles here: motion-
-   compensated warp + temporal blend + confidence-gated cross-fade. Replaces the
-   traced bionic-fg/GameScope "stage 6".
+A Vulkan implicit layer that sits between a game's swapchain and the
+compositor. On each present it synthesizes an interpolated in-between
+frame from the previous and current real frames, so the display sees
+roughly 2× the source FPS with no additional game rendering.
 
-Two selectable models share the same synthesis:
+Ships today as `libwin_fg.so` bundled with
+[Bannerlator](https://github.com/The412Banner/Bannerlator) — the Android
+Wine+DXVK+Turnip emulator this project targets first.
 
-- **Model 3** — symmetric flow (`backward = -forward`), confidence = 1.
-- **Model 4** — independently searched forward/backward flow with block-grid
-  search and sub-pixel refinement; confidence is gated by fwd/bwd disagreement
-  in `of3_expand_m4`, so occlusions and scene cuts degrade to a clean cross-fade
-  instead of ghosting.
+### Motion approach (Phase 1 — shipping)
+- Dense optical flow via our own subgroup-free reimplementation of
+  the AMD FidelityFX FSR3 pyramid + block-search algorithm (MIT).
+- Bidirectional flow with occlusion-gated confidence.
+- Softmax-splatting-inspired backward-warp blend (adapted for mobile).
+- Photometric-gate + cross-fade fallback for disoccluded regions.
+- HUD-rect exclusion so text/overlays don't ghost.
 
-## Pipeline
+### Motion approach (Phase 2 — planned)
+- Fine-tuned RIFE-4.25.lite (MIT) inference via NCNN Vulkan.
+- Self-captured game-frame training data.
+- Weights ship under MIT with full provenance chain.
+
+Full research writeup: [`docs/research/`](docs/research/).
+
+## Architecture at a glance
 
 ```
-prev,curr ─▶ of3_luma ─▶ of3_downsample ×N ─▶ of3_flow[_m4] (coarse→fine)
-                                                   │
-                                          of3_expand[_m4]
-                                                   │
-                                    flowExpA + flowExpB (+conf)
-                                                   │
-                                             wfg_synth ─▶ generated frame
+Game  ──►  DXVK  ──►  ⟨win-fg Vulkan layer⟩  ──►  Compositor  ──►  Display
+                       │
+                       ├── AcquireNextImageKHR      (grabs a spare swapchain image)
+                       ├── of3_flow / of3_expand    (optical flow, our shaders)
+                       ├── wfg_synth                (synthesizes midpoint frame)
+                       └── QueuePresentKHR          (generated then real — true 2×)
 ```
 
-## Build the shaders
+Sits **after** DXVK in the render chain — works with any game that
+already runs through DXVK/VKD3D. No engine cooperation required.
 
-```sh
-tools/build_shaders.sh          # -> build/spv/*.spv  (Vulkan 1.1 / SPIR-V 1.3)
+## Building
+
+Compiles as a standard Android Vulkan layer. CI in `.github/workflows/build.yml`
+produces `libwin_fg.so` + `VkLayer_win_framegen.json` artifacts per push.
+
+Local build (Linux host, NDK):
+```
+./tools/build_shaders.sh                    # glslang → SPIR-V → embedded_shaders.hpp
+mkdir build && cd build
+cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+      -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+      -DVULKAN_INCLUDE=/path/to/Vulkan-Headers/include ..
+cmake --build .
 ```
 
-All shaders must compile clean with `glslangValidator` for `--target-env
-vulkan1.1` (caps: Shader + ImageQuery only; `r32f`/`rgba16f`/`rgba8` storage) so
-they run on Turnip without extended-format or subgroup features.
+## Docs
 
-## Status
+| File | What |
+|---|---|
+| [`docs/research/SANFG.md`](docs/research/SANFG.md) | The endgame vision — Smart Adaptive Neural Frame Generation, success gates, phased plan |
+| [`docs/research/ROADMAP.md`](docs/research/ROADMAP.md) | Tier 1-4 branch list, gap analysis, 6-sprint implementation order |
+| [`docs/research/`](docs/research/) | 8 research writeups (algorithms, models, training pipelines, deployment, prior art) |
+| [`docs/PROVENANCE.md`](docs/PROVENANCE.md) | Shader-by-shader source + license attribution |
+| [`docs/BRINGUP.md`](docs/BRINGUP.md) | Device bring-up notes |
+| [`THIRD-PARTY.md`](THIRD-PARTY.md) | Full attribution ledger for every borrowed pattern |
 
-- [x] Clean optical-flow front end (carried over, MIT)
-- [x] Clean synthesis back end (`wfg_synth.comp`, written here)
-- [x] All shaders compile Turnip-safe
-- [x] Vulkan implicit-layer host (weight-free): dispatch, swapchain, present hook, compute engine
-- [x] SPIR-V embed generator (no traced table)
-- [x] CI compile → green (NDK r27d, libwin_fg.so builds)
-- [ ] Device bring-up: frame insertion + sync (see docs/BRINGUP.md), resume `fg011-m34` tuning
-- [ ] Bundle into Bannerlator, retire the traced layer
+## Clean-room protocol
+
+win-fg exists because [bionic-fg was taken down](https://github.com/The412Banner/Bannerlator)
+in 2026-08 for shipping SPIR-V shader bytecode derived from proprietary
+Lossless Scaling weights. **We do not repeat that mistake.**
+
+Every artifact this repo ships must satisfy:
+1. Code is MIT-original or borrowed from an MIT/BSD/Apache/zlib repo with attribution.
+2. Every `.comp` shader header cites the paper / algorithm it implements.
+3. Phase-2 model weights (when they arrive) are trained on self-captured
+   footage, optionally warm-started from a permissively-licensed public
+   checkpoint (RIFE MIT). Documented in `weights/PROVENANCE.md` at that time.
+4. Zero LSFG / DLSS3 / XeSS / proprietary bytecode enters the tree in any
+   form.
+5. `THIRD-PARTY.md` names every borrowed pattern + license + attribution.
 
 ## License
 
-MIT (ours). FidelityFX-derived optical-flow passes are MIT — see
-[NOTICE_FIDELITYFX_OPTICALFLOW.md](NOTICE_FIDELITYFX_OPTICALFLOW.md).
+[MIT](LICENSE) © 2026 The412Banner. Third-party attributions in
+[`THIRD-PARTY.md`](THIRD-PARTY.md).
+
+## Related projects
+
+- [Bannerlator](https://github.com/The412Banner/Bannerlator) — the Android emulator that consumes this layer
+- [AMD FidelityFX-SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) — motion-estimation base (FSR3 optical flow, MIT)
+- [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) — planned Phase-2 base model (MIT)
+- [NCNN](https://github.com/Tencent/ncnn) — planned Phase-2 inference runtime (BSD-3)

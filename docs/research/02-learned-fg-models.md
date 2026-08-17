@@ -11,7 +11,7 @@ hardware.
 |---|---|---|---|---|---|---|
 | **RIFE v4.25** | 2024 | 5.66M | ~11 MB (≈23 MB fp32) | **MIT** | Marginal on Adreno 750 | Best quality/perf balance in permissive space |
 | **RIFE v4.25.lite** | 2024 | ~3M est. | ~5–7 MB est. | **MIT** | ✅ Yes | Mobile ceiling with clean license |
-| **RIFE v4.22.lite (ONNX)** | 2024 | ~2M est. | 9.8 MB fp16 exported | **MIT** | ✅ Yes | Confirmed ONNX-exported mobile variant |
+| **RIFE v4.22.lite (ONNX)** | 2024 | ~2M est. | ~9.8 MB fp16 reported | **MIT** | ✅ Yes | ONNX-exported mobile variant (via `square-zero-labs/rife-onnx`; HF repo has no model card so size unverified — treat as reference, re-export ourselves) |
 | **IFRNet** | 2022 | ~5M | ~10 MB | **MIT** | Marginal | 15× faster than DAIN at similar quality |
 | **IFRNet_S** | 2022 | ~2.8M | ~5.5 MB | **MIT** | ✅ Yes | Cleanest lightweight architecture |
 | **IFRNet_L** | 2022 | ~19M | ~38 MB | **MIT** | ❌ | Quality-first desktop |
@@ -34,7 +34,7 @@ hardware.
 - **RIFE (all v4.x + all .lite)** — MIT. Cleanest single choice. hzwer confirmed as copyright holder.
 - **IFRNet** — MIT (ltkong218). All variants same license.
 - **EMA-VFI** — Apache 2.0 (too big to ship, but clean base for distillation).
-- **FILM (Google)** — Apache 2.0.
+- **FILM (Google)** — Apache 2.0. ⚠️ Upstream repo is ARCHIVED as of 2025; code still usable under Apache-2.0 but no new commits.
 - **FSR3-FG** — MIT, but NOT a learned model (algorithmic).
 
 ### Research-only / non-commercial (do NOT ship weights or derivatives commercially)
@@ -51,7 +51,7 @@ hardware.
 
 ### Rationale
 1. **License is airtight** — MIT, hzwer holds copyright, upstream explicitly states weights "under the same MIT license as this project." We can ship modified weights, fine-tune, redistribute, commercial use OK.
-2. **Size fits mobile** — 4.22.lite fp16 ONNX proven at 9.8 MB (verified on `square-zero-labs/rife-onnx` HF repo); 4.25.lite likely similar. Fits comfortably in an APK asset.
+2. **Size fits mobile** — 4.25 upstream is 5.66M params ≈ 11 MB fp16 (verified on `mlx-community/RIFE-4.25` HF card). 4.22.lite ONNX exports exist in the wild (~9.8 MB fp16 reported on `square-zero-labs/rife-onnx`; that HF repo has no model card so treat the exact size as unverified until we re-export ourselves). Fits comfortably in an APK asset.
 3. **Architecture is right** — IFNet-based (5 coarse-to-fine IFBlocks c=[192,128,96,64,32]), converges quickly on 720p–1080p inputs, real-time-capable on desktop GPUs, adaptable to Adreno via SPIR-V compute or QNN HTP.
 4. **Confirmed export path** — ONNX exports exist in the wild (HF, SVFI project), so PyTorch → ONNX → NCNN/QNN/SPIR-V is a walked path.
 5. **Fallback path** — if we can't hit budget, IFRNet_S (MIT, ~2.8M params) is the second choice with an even smaller footprint.

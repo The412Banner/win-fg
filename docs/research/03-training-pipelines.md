@@ -121,7 +121,7 @@ For our shipped weights to be defensible:
 - [Vimeo90K structure/download — CAIN DeepWiki](https://deepwiki.com/myungsub/CAIN/5.1-vimeo90k-dataset)
 - [TOFlow / Vimeo-90K origin (Xue et al.)](http://toflow.csail.mit.edu/)
 - [XVFI / X4K1000FPS paper](https://arxiv.org/abs/2103.16206)
-- [XVFI GitHub](https://github.com/rsjjdesj/XVFI)
+- [XVFI GitHub](https://github.com/JihyongOh/XVFI)
 - [SNU-FILM benchmark — CAIN GitHub](https://github.com/myungsub/CAIN)
 - [Practical-RIFE (MIT)](https://github.com/hzwer/Practical-RIFE)
 - [ECCV2022-RIFE](https://github.com/hzwer/ECCV2022-RIFE)
