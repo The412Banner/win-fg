@@ -302,7 +302,22 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
     // force sampled+storage usage so the compute engine can read/write frames
     VkSwapchainCreateInfoKHR ci = *pCreateInfo;
     ci.imageUsage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // Bump minImageCount by +1 so 2x frame insertion has a reliable spare image to
+    // acquire. Without this, the game holds most of the 2-3 swapchain images in
+    // flight and AcquireNextImageKHR for the extra "generated" present starves,
+    // dropping us into the 3a fallback (single present, no doubling). Standard
+    // FG trick — LSFG/FSR3 do the same. If the driver rejects (surface max
+    // exceeded, memory), retry with the game's original count so we don't take
+    // the app down.
+    const uint32_t origMin = pCreateInfo->minImageCount;
+    ci.minImageCount = origMin + 1u;
     VkResult r = st.dd.CreateSwapchainKHR(device, &ci, pAlloc, pSwapchain);
+    if (r != VK_SUCCESS) {
+        WFG_LOGI("CreateSwapchain(minImageCount=%u) rejected (r=%d), retrying with app's minImageCount=%u",
+                 ci.minImageCount, (int)r, origMin);
+        ci.minImageCount = origMin;
+        r = st.dd.CreateSwapchainKHR(device, &ci, pAlloc, pSwapchain);
+    }
     if (r != VK_SUCCESS) return r;
     SwapState s; s.swapchain = *pSwapchain; s.format = pCreateInfo->imageFormat; s.extent = pCreateInfo->imageExtent;
     uint32_t n = 0; st.dd.GetSwapchainImagesKHR(device, *pSwapchain, &n, nullptr);
