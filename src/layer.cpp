@@ -483,7 +483,12 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
 
             imgBarrier(dd, fc.cmd, currImg, PS, SR, 0, VK_ACCESS_SHADER_READ_BIT, ALL, CS);
             imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, CS);
-            st->fg.record(fc.cmd, s.prevView, currView, gt.view, 0.5f);              // synth -> gen (rgba8)
+            // alpha = temporal position of the generated frame between prev (0) and curr (1).
+            // 0.5 = perfect midpoint but reads as maximum "half-and-half" ghost on HUD/text.
+            // Biasing to 0.35 (closer to prev) reduces the visible double-exposure at the
+            // cost of some pacing accuracy; the synth crossfade fallback also blends less
+            // aggressively. Iterative bring-up knob — sits alongside the swapchain+1 fix.
+            st->fg.record(fc.cmd, s.prevView, currView, gt.view, 0.35f);              // synth -> gen (rgba8)
             imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_GENERAL, TS, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
             imgBarrier(dd, fc.cmd, currImg, SR, TS, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
             imgBarrier(dd, fc.cmd, s.prevImg, SR, TD, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, TR);
