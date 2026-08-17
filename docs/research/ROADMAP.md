@@ -7,6 +7,32 @@ by ROI to the SANFG endgame described in `SANFG.md`.
 **Every branch listed here has a citation trail.** Follow the linked
 research doc for algorithm sources and license notes.
 
+## Design principle — FG is binary (2026-08-17)
+
+**Frame generation is either fully on or fully off — no runtime toggling.**
+Dynamic "skip FG under load" or "auto-disable during heavy scenes" behaviors
+are REJECTED because turning FG on/off mid-play introduces visible stutter
+(sudden change in perceived framerate). If the user wants FG off, they
+turn it off in the drawer. If they want it on, it stays on for the whole
+session.
+
+**Rejected patterns** (do not revisit):
+- `feat/gpu-saturation-skip` — Isygold's 60-frame skip window on watchdog trip. **Rejected 2026-08-17**: causes stutter every time skip window fires/ends.
+- `feat/tier-gated-auto` — auto-enable/disable FG from frame-time EMA. **Rejected 2026-08-17**: hysteresis notwithstanding, the on↔off transitions are visible.
+- `feat/motion-magnitude-bailout` — pass through during fast pans. **Rejected 2026-08-17**: same class of problem.
+
+**Adaptive patterns that ARE allowed** (per-pixel or per-parameter
+continuous change, not on/off toggles):
+- `feat/adaptive-gate` — per-frame tune of synth `photoScale`/`epsilon`. Smooth parameter drift, FG stays on throughout.
+- `feat/adaptive-alpha` — per-frame tune of temporal alpha. Smooth drift.
+- `feat/heuristic-hud-detect` — auto-populate HUD rect from motion history. Rect adjusts smoothly; FG stays on.
+- `feat/per-game-preset-cache` — load per-game knobs at launch. No runtime toggling.
+- `feat/dynamic-flow-resolution` — flow-solve resolution changes with budget. **Under review — quality shift may be visible; may end up rejected.**
+- `feat/confidence-driven-crossfade` — per-pixel smooth blend of synth vs crossfade based on confidence. Already partly in `wfg_synth`.
+
+Any future branch that adds runtime on/off transitions of FG dispatch
+gets rejected up front.
+
 ## Current state (2026-08-17)
 
 | Component | State |
@@ -25,12 +51,7 @@ research doc for algorithm sources and license notes.
 Each ~1-2 days of implementation + 1 hotswap cycle. All classical, all
 clean-room, all inside `libwin_fg.so`.
 
-### T1-A. `feat/gpu-saturation-skip`
-- **What:** watchdog on fence-wait latency. N slow trips (>25ms) → skip FG for W frames → probe.
-- **Effort:** ~30 LOC C++.
-- **Source:** `07-isygold-vegas-inspirations.md` (Isygold Vegas kit constants N=5, W=60; behavior re-implemented).
-- **Fixes:** graceful degradation under load; stops FG from making choking games worse.
-- **Depends on:** nothing.
+### ~~T1-A. `feat/gpu-saturation-skip`~~ — REJECTED (see design principle above)
 
 ### T1-B. `feat/present-wait-pacing`
 - **What:** use `VK_KHR_present_wait` (or `VK_EXT_present_timing` on Mesa 26.1+) to space generated frame at `T` and real frame at `T + refresh/2`.
@@ -39,12 +60,7 @@ clean-room, all inside `libwin_fg.so`.
 - **Fixes:** doubling-rate lift beyond swapchain+1 alone. Push ~25% → ~90%.
 - **Depends on:** nothing.
 
-### T1-C. `feat/tier-gated-auto`
-- **What:** auto-decides FG on/off from smoothed frame-time EMA.
-- **Effort:** ~50 LOC.
-- **Source:** `07-isygold-vegas-inspirations.md` (thresholds T2≤29ms, T3≤33ms borrowed as Snapdragon-tier starting points; state machine independent).
-- **Fixes:** stops FG punishing games that can't afford compute budget.
-- **Depends on:** nothing.
+### ~~T1-C. `feat/tier-gated-auto`~~ — REJECTED (see design principle above)
 
 ### T1-D. `feat/median-flow-filter`
 - **What:** 3×3 median filter post-process on `of3_flow` output. Kills outlier flow vectors.
