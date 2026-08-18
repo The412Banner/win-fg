@@ -160,6 +160,25 @@ void main() {
     float photoTrust = 1.0 - smoothstep(0.04, 0.18, photoErr);
     float trust = clamp(consist, 0.0, 1.0) * photoTrust;
     trust *= smoothstep(0.0, epsilon, Wsum);      // both-unreliable -> 0
+
+    // ── Content-diff double-exposure fallback ─────────────────────────────────
+    // Video-analysis 2026-08-17 (Kratos hand-gesture melts at t=50/60/80):
+    // when the flow gate rejects a pixel AND prev+curr LOOK VERY DIFFERENT at
+    // that pixel (large object motion beyond flow reach — a hand that swept
+    // across 100+ px between two real frames at 24 fps), the crossfade above
+    // averages two totally different scenes = classic "two-hand double
+    // exposure" ghost. Snap to real curr in that case: lose the FG smoothness
+    // on those specific pixels for that frame, but no visible ghost. The rest
+    // of the frame keeps its interpolation. Soft switch so we don't create
+    // hard seams around moving edges.
+    vec3 prevC = texture(uPrev, uv).rgb;
+    vec3 currC = texture(uCurr, uv).rgb;
+    float contentDiff = length(currC - prevC);      // 0 = identical, ~1.7 = max diff
+    float untrusted   = 1.0 - smoothstep(0.10, 0.25, trust);   // 1 when trust < ~0.15
+    float bigDiff     = smoothstep(0.20, 0.40, contentDiff);    // 1 when diff > ~0.30
+    float snapToCurr  = untrusted * bigDiff;
+    crossfade = mix(crossfade, currC, snapToCurr);
+
     vec3 outc = mix(crossfade, warped, trust);
 
     // DEBUG flow visualiser (flowScale>5 sentinel): replace the generated frame with
