@@ -518,10 +518,24 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 presentOne(fc.genSem, spareIdx);            // generated (in-between) frame first
                 return presentOne(fc.currSem, idx);         // then the real frame
             } else {
-                // no spare available -> fall back to 3a (blit generated over curr, single present)
-                imgBarrier(dd, fc.cmd, currImg, TS, TD, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, TR, TR);
-                dd.CmdBlitImage(fc.cmd, gt.img, TS, currImg, TD, 1, &bl, VK_FILTER_NEAREST);
-                imgBarrier(dd, fc.cmd, currImg, TD, PS, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, ALL);
+                // No spare image available -> we cannot true-2x this frame.
+                // Old behavior: blit the synthesized frame over curr and present
+                // that (Phase 3a). Problem: on the OCCASIONAL fallback (say
+                // acquire starves for ~1 frame), the display gets a warped-and-
+                // wrong-looking single frame instead of the real one — reads as
+                // the "frame or two of ghost/jitter" that the user reported
+                // 2026-08-17. The interpolated synthesis is only trustworthy
+                // when we can also show the REAL frame alongside it (the true
+                // 2x insert path); shown alone, a single-frame warp with any
+                // small flow error is highly visible.
+                //
+                // New behavior: present the real curr UNTOUCHED on fallback.
+                // Compute + prev-copy already recorded above still run (needed
+                // so next frame has a valid prev). We just skip the blit-over.
+                // Net effect of a fallback: one plain real frame instead of one
+                // ghosted frame. Invisible to the user; the 2x FPS boost only
+                // pauses for that single present.
+                imgBarrier(dd, fc.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL);
                 dd.EndCommandBuffer(fc.cmd);
                 submitOne(fc.currSem);
                 return presentOne(fc.currSem, idx);

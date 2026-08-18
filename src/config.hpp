@@ -25,8 +25,12 @@ struct Config {
     // pushes borderline pixels toward the safe cross-fade path (softer, but no
     // smear). Prewarp will lift the ceiling further; this is the "safety net"
     // knob change until then.
-    float    epsilon     = 0.10f;  // disocclusion floor (was 0.05)
-    float    photoScale  = 9.0f;   // photometric residual scale into Z (was 6.0)
+    // Walked back from (0.10, 9.0) tighten after user reported softening. The
+    // real fix for the residual ghosts is the 3a-fallback path change in
+    // layer.cpp (present real curr on fallback instead of blitting synth over);
+    // the gate can stay closer to the original values now.
+    float    epsilon     = 0.07f;  // disocclusion floor (0.05 -> 0.10 -> 0.07)
+    float    photoScale  = 7.5f;   // photometric residual scale into Z (6.0 -> 9.0 -> 7.5)
     // HUD exclusion rect in pixel coords (x0,y0,x1,y1). Fragments inside are
     // passed through as the real current frame (no warp, no synth) so text /
     // overlays don't ghost. Disabled when x0 >= x1 or y0 >= y1 (the default).
