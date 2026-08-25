@@ -622,7 +622,22 @@ static VkResult asyncGenPresent(DeviceState& st, SwapState& s, VkQueue queue,
     AsyncCtx& a = s.async;
     const DeviceDispatch& dd = st.dd; VkDevice dev = st.device;
 
-    if (st.resetPrev) { a.warmup = 0; a.prevValid = false; a.outValid[0] = a.outValid[1] = false; st.resetPrev = false; }
+    if (st.resetPrev) {
+        // Toggle/model/flow/multiplier change -> restart the pipeline cleanly. Drain
+        // the GPU, then RECREATE the cross-cycle computeDone semaphores: one of them
+        // may hold a signal whose waiter (next cycle's graphics blit) never ran, and
+        // re-signalling a still-signalled binary semaphore is illegal. All per-cycle
+        // semaphores are already consumed once the device is idle.
+        if (dd.DeviceWaitIdle) dd.DeviceWaitIdle(dev);
+        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        for (int i = 0; i < 2; ++i) {
+            if (a.computeDone[i]) dd.DestroySemaphore(dev, a.computeDone[i], nullptr);
+            dd.CreateSemaphore(dev, &si, nullptr, &a.computeDone[i]);
+        }
+        a.warmup = 0; a.prevValid = false; a.outValid[0] = a.outValid[1] = false;
+        a.prevGFence = VK_NULL_HANDLE; a.prevCFence = VK_NULL_HANDLE;  // GPU idle -> no fence to wait
+        st.resetPrev = false;
+    }
 
     const uint64_t cyc = a.cycle;
     const int imgSlot  = (int)(cyc & 1);
