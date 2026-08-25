@@ -1,4 +1,25 @@
 
+## 2026-08-25 — C1 GLOBAL-MOTION PRE-WARP implemented (branch feat/c1-global-motion-prewarp, off feat/quality-tier2 @ a1ca5e6)
+- Attacks the settled root cause below (flow SATURATION on fast camera motion → oil-paint
+  melt) at its source: estimate the per-frame camera AFFINE with inverse-compositional
+  Lucas-Kanade (Baker & Matthews 2004; Szeliski §6.2) on 1/8-res luma and REMOVE it
+  before the dense SAD search, so the search only ever sees small, coherent, object-only
+  residual motion. Global affine is composed back in of3_expand(_m4) → wfg_synth unchanged.
+- New shaders: `of3_gm_reduce.comp` (accumulate 6x6 LK normal equations, NO float atomics —
+  fixed 512 threads each write their own partial sum, CPU sums in double + Cholesky solve;
+  Huber-robust), `of3_gm_prewarp.comp` (bilinear affine warp of the curr luma pyramid).
+- Solve is DECOUPLED / stall-free: reads back the reduce SSBO the present ring already
+  fence-waited (per-slot SSBO bound to the FrameCtx), one Gauss-Newton step/frame warm-
+  started from the running estimate (~1-2 frame latency; camera motion is temporally
+  smooth so it tracks). SAME affine removed + added back ⇒ result exact for any affine;
+  IDENTITY affine ⇒ byte-identical to pre-C1, so bail-to-identity ≤ "no pre-warp" always.
+- Robustify + bail: coverage floor, bounded GN step, PD Cholesky, final sanity clamp →
+  otherwise keep identity. Auto-engages after 3 consecutive good solves.
+- Knob: `WIN_FG_GM` env / `global_motion=auto|on|off` in conf.toml (default auto). Logs
+  (tag win-fg) engage state + estimated global translation (px) every 300 frames.
+- Added GPU cost estimate: ~0.1–0.2 ms/frame (reduce on ~40k texels + 5 tiny prewarp
+  levels); CPU solve ~10–20 µs. CI-green target; NOT device-proven (owner's next step).
+
 ## 2026-08-12 — blur/melt root-caused: flow SATURATION on camera motion
 - Long device debug of "blurry in motion, bg/fg fixes it". Ruled out (proven in code
   + logs): NOT 3a-fallback (insert=N fallback=0 always), NOT flow accumulation (flow

@@ -6,7 +6,9 @@ import sys, pathlib
 
 SHADERS = [
     "of3_luma", "of3_downsample", "of3_flow", "of3_expand",
-    "of3_flow_m4", "of3_expand_m4", "wfg_synth",
+    "of3_flow_m4", "of3_expand_m4",
+    "of3_gm_reduce", "of3_gm_prewarp",   # C1 global-motion pre-warp
+    "wfg_synth",
 ]
 
 def emit(spv_dir: pathlib.Path, out: pathlib.Path):

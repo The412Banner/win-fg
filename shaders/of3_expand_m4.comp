@@ -37,7 +37,22 @@ layout(binding = 0) uniform U {
     float occlHi;      // rel. disagreement at which flow is fully suppressed
 };
 
-layout(binding = 32) uniform sampler2D uFlowFine;             // finest solved flow (.xy fwd, .zw bwd)
+// C1 global-motion add-back (see of3_gm_reduce/of3_gm_prewarp). fwd/bwd here are
+// now OBJECT-ONLY residuals searched in stabilized space; recombine the estimated
+// global affine so wfg_synth sees the full flow. Consistency (conf) is measured
+// on the residuals — the global part cancels in fwd+bwd, so removing it makes the
+// occlusion signal cleaner. The global displacement is applied at FULL strength
+// (camera motion is reliable) while only the residual is attenuated by conf, so a
+// low-confidence pixel during a pan still reprojects by camera motion instead of
+// collapsing to a (melting) cross-fade. Identity affine ⇒ exact pre-C1 output.
+layout(binding = 1) uniform GM {
+    vec4 gmLin;    // running estimate (unused here)
+    vec4 gmLinT;   // (unused here)
+    vec4 gmApp;    // APPLIED p1,p2,p3,p4  -> P=[[p1,p3],[p2,p4]]
+    vec4 gmAppT;   // APPLIED tx,ty
+};
+
+layout(binding = 32) uniform sampler2D uFlowFine;             // finest solved flow (.xy fwd, .zw bwd), residual
 layout(binding = 48, rgba16f) uniform writeonly image2D uFwd; // -> flowExpA_
 layout(binding = 49, rgba16f) uniform writeonly image2D uBwd; // -> flowExpB_
 
@@ -85,6 +100,15 @@ void main() {
     float rel = length(fwd + bwd) / mag;
     float conf = 1.0 - smoothstep(occlLo, occlHi, rel);
 
-    imageStore(uFwd, gid, vec4(fwd * conf, 0.0, conf));
-    imageStore(uBwd, gid, vec4(bwd * conf, 0.0, conf));
+    // ── C1 global-motion add-back ─────────────────────────────────────────────
+    // g(x) at full strength; residual attenuated by conf. Identity ⇒ pre-C1.
+    vec2 q   = uv - 0.5;
+    vec2 gpx = vec2(gmApp.x * q.x + gmApp.z * q.y + gmAppT.x,
+                    gmApp.y * q.x + gmApp.w * q.y + gmAppT.y) * vec2(dim);
+    mat2 A2  = mat2(1.0 + gmApp.x, gmApp.y, gmApp.z, 1.0 + gmApp.w);  // I + P
+    vec2 fullFwd =  gpx + conf * (A2 * fwd);
+    vec2 fullBwd = -gpx + conf * (A2 * bwd);
+
+    imageStore(uFwd, gid, vec4(fullFwd, 0.0, conf));
+    imageStore(uBwd, gid, vec4(fullBwd, 0.0, conf));
 }

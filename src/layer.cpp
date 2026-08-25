@@ -418,8 +418,11 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             if (st->resetPrev) { s.prevValid = false; st->resetPrev = false; }  // fresh prev on toggle
             const DeviceDispatch& dd = st->dd;
             VkDevice dev = st->device;
-            FrameCtx& fc = s.ring[s.ringIdx];
+            uint32_t fcIdx = s.ringIdx;                 // C1: this slot indexes the GM SSBO to read/reduce
+            FrameCtx& fc = s.ring[fcIdx];
             s.ringIdx = (s.ringIdx + 1) % s.ring.size();
+            // Waiting fc.fence guarantees this slot's PREVIOUS reduce (its SSBO
+            // write) has completed, so record() can safely read it back on the host.
             if (fc.submitted) { dd.WaitForFences(dev, 1, &fc.fence, VK_TRUE, UINT64_MAX); dd.ResetFences(dev, 1, &fc.fence); fc.submitted = false; }
 
             VkImage currImg = s.images[idx];
@@ -488,7 +491,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             // Biasing to 0.35 (closer to prev) reduces the visible double-exposure at the
             // cost of some pacing accuracy; the synth crossfade fallback also blends less
             // aggressively. Iterative bring-up knob — sits alongside the swapchain+1 fix.
-            st->fg.record(fc.cmd, s.prevView, currView, gt.view, 0.35f);              // synth -> gen (rgba8)
+            st->fg.record(fc.cmd, s.prevView, currView, gt.view, 0.35f, fcIdx);       // synth -> gen (rgba8); fcIdx = C1 GM slot
             imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_GENERAL, TS, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
             imgBarrier(dd, fc.cmd, currImg, SR, TS, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
             imgBarrier(dd, fc.cmd, s.prevImg, SR, TD, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, TR);

@@ -24,7 +24,19 @@ layout(binding = 0) uniform U {
     uint  pad1;
 };
 
-layout(binding = 32) uniform sampler2D uFlowFine;            // finest solved flow, full-res px
+// C1 global-motion add-back. The finest solved flow is now an OBJECT-ONLY
+// residual (of3_gm_prewarp removed the global/camera motion before the search),
+// so recombine the estimated global affine here to hand wfg_synth the SAME full
+// flow it would have received with no pre-warp. Identity params ⇒ exact
+// pass-through (byte-identical to pre-C1). See of3_gm_reduce/of3_gm_prewarp.
+layout(binding = 1) uniform GM {
+    vec4 gmLin;    // running estimate (unused here)
+    vec4 gmLinT;   // (unused here)
+    vec4 gmApp;    // APPLIED p1,p2,p3,p4  -> P=[[p1,p3],[p2,p4]]
+    vec4 gmAppT;   // APPLIED tx,ty
+};
+
+layout(binding = 32) uniform sampler2D uFlowFine;            // finest solved flow, full-res px (residual)
 layout(binding = 48, rgba16f) uniform writeonly image2D uFwd; // -> flowExpA_
 layout(binding = 49, rgba16f) uniform writeonly image2D uBwd; // -> flowExpB_
 
@@ -71,6 +83,17 @@ void main() {
     vec2 d = vec2(med5(c.x, xm.x, xp.x, ym.x, yp.x),
                   med5(c.y, xm.y, xp.y, ym.y, yp.y));
 
-    imageStore(uFwd, gid, vec4( d, 0.0, 1.0));
-    imageStore(uBwd, gid, vec4(-d, 0.0, 1.0));
+    // ── C1 global-motion add-back ─────────────────────────────────────────────
+    // full(x) = g(x) + (I+P)·residual, the exact linear composition of the global
+    // affine warp W (prev→curr) with the residual searched in stabilized space:
+    //   W_px(x) - x = g(x)   (global disp, full-res px),   dW/dx = I+P.
+    // Identity affine (gmApp=0) ⇒ g=0, I+P=I ⇒ full=d (pre-C1 behaviour exactly).
+    vec2 q   = uv - 0.5;
+    vec2 gpx = vec2(gmApp.x * q.x + gmApp.z * q.y + gmAppT.x,
+                    gmApp.y * q.x + gmApp.w * q.y + gmAppT.y) * vec2(dim);
+    mat2 A2  = mat2(1.0 + gmApp.x, gmApp.y, gmApp.z, 1.0 + gmApp.w);  // I + P
+    vec2 full = gpx + A2 * d;
+
+    imageStore(uFwd, gid, vec4( full, 0.0, 1.0));
+    imageStore(uBwd, gid, vec4(-full, 0.0, 1.0));
 }

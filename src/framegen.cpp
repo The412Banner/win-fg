@@ -49,6 +49,30 @@ void FrameGen::destroyImage(Img& i) {
     i = Img{};
 }
 
+// C1: allocate the per-slot host-visible SSBOs the LK reduce writes partials into.
+// Host-visible + coherent so the CPU can read them back after the owning frame's
+// fence signals (no staging copy needed; the buffers are tiny — kGmThreads*kGmStride
+// floats each, ~64 KB). Persistently mapped.
+bool FrameGen::makeGmBuffers() {
+    const VkDeviceSize sz = (VkDeviceSize)kGmThreads * kGmStride * sizeof(float);
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (int s = 0; s < kGmSlots; ++s) {
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bi.size = sz; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VKOK(dd_->CreateBuffer(device_, &bi, nullptr, &gmSsbo_[s]));
+        VkMemoryRequirements mr; dd_->GetBufferMemoryRequirements(device_, gmSsbo_[s], &mr);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = mr.size; ai.memoryTypeIndex = findMemType(mr.memoryTypeBits, want);
+        VKOK(dd_->AllocateMemory(device_, &ai, nullptr, &gmSsboMem_[s]));
+        VKOK(dd_->BindBufferMemory(device_, gmSsbo_[s], gmSsboMem_[s], 0));
+        VKOK(dd_->MapMemory(device_, gmSsboMem_[s], 0, sz, 0, &gmSsboPtr_[s]));
+        std::memset(gmSsboPtr_[s], 0, (size_t)sz);
+        gmSlotValid_[s] = false;
+    }
+    gmBuffersReady_ = true;
+    return true;
+}
+
 bool FrameGen::makePipe(Pipe& p, int shaderId,
                         const std::vector<VkDescriptorType>&) {
     // binding layout is derived per shader below in init(); here we only build
@@ -104,25 +128,31 @@ bool FrameGen::init(const DeviceDispatch* dd, const InstanceDispatch* id,
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 256},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16},   // C1 LK-reduce SSBOs
     };
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pci.maxSets = 256; pci.poolSizeCount = 3; pci.pPoolSizes = sizes;
+    pci.maxSets = 256; pci.poolSizeCount = 4; pci.pPoolSizes = sizes;
     VKOK(dd_->CreateDescriptorPool(device_, &pci, nullptr, &descPool_));
 
     using B = std::pair<uint32_t, VkDescriptorType>;
     const auto S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     const auto W = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     const auto U = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    const auto SB = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 
     // per-shader binding sets (match the GLSL layout(binding=...) declarations)
     if (!buildSetLayout(dd_, dev, {B{32,S},B{48,W}}, pLuma_.setLayout)) return false;
     if (!buildSetLayout(dd_, dev, {B{32,S},B{48,W}}, pDown_.setLayout)) return false;
     if (!buildSetLayout(dd_, dev, {B{0,U},B{32,S},B{33,S},B{34,S},B{48,W}}, pFlow_.setLayout)) return false;
     if (!buildSetLayout(dd_, dev, {B{0,U},B{32,S},B{33,S},B{34,S},B{48,W}}, pFlowM4_.setLayout)) return false;
-    if (!buildSetLayout(dd_, dev, {B{0,U},B{32,S},B{48,W},B{49,W}}, pExpand_.setLayout)) return false;
-    if (!buildSetLayout(dd_, dev, {B{0,U},B{32,S},B{48,W},B{49,W}}, pExpandM4_.setLayout)) return false;
+    // C1: expand sets gain a second UBO (binding 1 = GMUBO) for the global-motion add-back.
+    if (!buildSetLayout(dd_, dev, {B{0,U},B{1,U},B{32,S},B{48,W},B{49,W}}, pExpand_.setLayout)) return false;
+    if (!buildSetLayout(dd_, dev, {B{0,U},B{1,U},B{32,S},B{48,W},B{49,W}}, pExpandM4_.setLayout)) return false;
     if (!buildSetLayout(dd_, dev, {B{0,U},B{32,S},B{33,S},B{34,S},B{35,S},B{48,W}}, pSynth_.setLayout)) return false;
+    // C1: LK-reduce (UBO, SSBO, prev, curr) and curr-luma stabilization prewarp (UBO, src, dst).
+    if (!buildSetLayout(dd_, dev, {B{1,U},B{16,SB},B{32,S},B{33,S}}, pGmReduce_.setLayout)) return false;
+    if (!buildSetLayout(dd_, dev, {B{1,U},B{32,S},B{48,W}}, pGmPrewarp_.setLayout)) return false;
 
     std::vector<VkDescriptorType> unused;
     if (!makePipe(pLuma_,     embedded::OF3_LUMA, unused)) return false;
@@ -131,8 +161,12 @@ bool FrameGen::init(const DeviceDispatch* dd, const InstanceDispatch* id,
     if (!makePipe(pFlowM4_,   embedded::OF3_FLOW_M4, unused)) return false;
     if (!makePipe(pExpand_,   embedded::OF3_EXPAND, unused)) return false;
     if (!makePipe(pExpandM4_, embedded::OF3_EXPAND_M4, unused)) return false;
+    if (!makePipe(pGmReduce_,  embedded::OF3_GM_REDUCE,  unused)) return false;
+    if (!makePipe(pGmPrewarp_, embedded::OF3_GM_PREWARP, unused)) return false;
     if (!makePipe(pSynth_,    embedded::WFG_SYNTH, unused)) return false;
-    WFG_LOGI("framegen init ok (queueFamily=%u, 7 pipelines, model=%d)", queueFamily_, cfg_.model);
+    if (!makeGmBuffers()) { WFG_LOGE("framegen: GM SSBO alloc failed — C1 disabled"); }
+    WFG_LOGI("framegen init ok (queueFamily=%u, 9 pipelines, model=%d, C1 gm=%d)",
+             queueFamily_, cfg_.model, cfg_.gmMode);
     return true;
 }
 
@@ -145,6 +179,7 @@ bool FrameGen::onResize(VkExtent2D extent, VkFormat /*colorFormat*/) {
     // tear down previous size
     for (auto& i : pyrA_) destroyImage(i); pyrA_.clear();
     for (auto& i : pyrB_) destroyImage(i); pyrB_.clear();
+    for (auto& i : pyrAs_) destroyImage(i); pyrAs_.clear();
     for (auto& i : flowLvl_) destroyImage(i); flowLvl_.clear();
     destroyImage(flowExpA_); destroyImage(flowExpB_);
     extent_ = extent; ready_ = false;
@@ -158,6 +193,10 @@ bool FrameGen::onResize(VkExtent2D extent, VkFormat /*colorFormat*/) {
         if (!makeImage(pyrB_[l], e, VK_FORMAT_R32_SFLOAT, lumaUsage)) return false;
         if (!makeImage(flowLvl_[l], e, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
     }
+    // C1: stabilized curr luma — only the levels the dense flow reads (finest..coarsest).
+    pyrAs_.resize(kLevels);
+    for (int l = kFlowFinest; l < kLevels; ++l)
+        if (!makeImage(pyrAs_[l], levelExtent(extent, l), VK_FORMAT_R32_SFLOAT, lumaUsage)) return false;
     if (!makeImage(flowExpA_, extent, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
     if (!makeImage(flowExpB_, extent, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
     ready_ = true;
@@ -189,10 +228,19 @@ void FrameGen::destroy() {
     dd_->DeviceWaitIdle(device_);
     for (auto& i : pyrA_) destroyImage(i); pyrA_.clear();
     for (auto& i : pyrB_) destroyImage(i); pyrB_.clear();
+    for (auto& i : pyrAs_) destroyImage(i); pyrAs_.clear();
     for (auto& i : flowLvl_) destroyImage(i); flowLvl_.clear();
     destroyImage(flowExpA_); destroyImage(flowExpB_);
     destroyPipe(pLuma_); destroyPipe(pDown_); destroyPipe(pFlow_); destroyPipe(pFlowM4_);
     destroyPipe(pExpand_); destroyPipe(pExpandM4_); destroyPipe(pSynth_);
+    destroyPipe(pGmReduce_); destroyPipe(pGmPrewarp_);
+    for (int s = 0; s < kGmSlots; ++s) {
+        if (gmSsboMem_[s]) dd_->UnmapMemory(device_, gmSsboMem_[s]);
+        if (gmSsbo_[s]) dd_->DestroyBuffer(device_, gmSsbo_[s], nullptr);
+        if (gmSsboMem_[s]) dd_->FreeMemory(device_, gmSsboMem_[s], nullptr);
+        gmSsbo_[s] = VK_NULL_HANDLE; gmSsboMem_[s] = VK_NULL_HANDLE; gmSsboPtr_[s] = nullptr;
+    }
+    gmBuffersReady_ = false;
     if (descPool_) dd_->DestroyDescriptorPool(device_, descPool_, nullptr);
     if (linear_) dd_->DestroySampler(device_, linear_, nullptr);
     descPool_ = VK_NULL_HANDLE; linear_ = VK_NULL_HANDLE; device_ = VK_NULL_HANDLE; ready_ = false;

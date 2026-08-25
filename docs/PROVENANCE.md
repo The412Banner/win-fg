@@ -25,7 +25,9 @@ principles. Full FidelityFX attribution in
 | Coarse→fine flow | `shaders/of3_flow.comp` | our subgroup-free reimpl of the FSR3 SAD block search | MIT (AMD FidelityFX) |
 | Flow expand | `shaders/of3_expand.comp` | our adaptation of the FSR3 scale pass | MIT (AMD FidelityFX) |
 | Bidirectional flow | `shaders/of3_flow_m4.comp` | our extension (independent fwd + bwd search) | MIT (ours) |
-| Occlusion-gated expand | `shaders/of3_expand_m4.comp` | our extension of the above | MIT (ours) |
+| Occlusion-gated expand | `shaders/of3_expand_m4.comp` | our extension of the above (+ C1 global-motion add-back) | MIT (ours) |
+| **Global-motion LK reduce (C1)** | `shaders/of3_gm_reduce.comp` | **written from first principles** (inverse-compositional LK normal equations) | MIT (ours) |
+| **Global-motion pre-warp (C1)** | `shaders/of3_gm_prewarp.comp` | **written from first principles** (affine image warp) | MIT (ours) |
 | **Frame synthesis** | `shaders/wfg_synth.comp` | **written from first principles** | MIT (ours) |
 
 ## Synthesis math
@@ -42,6 +44,32 @@ from published papers** (equations only — no third-party code):
 | Brightness-constancy photometric residual | Horn & Schunck, 1981 |
 | Forward/backward consistency (occlusion) | Sundaram et al. 2010; OCAI (arXiv:2403.18092) |
 | Dual disocclusion / reprojection fallback | AMD FidelityFX FSR3 frame interpolation (MIT) |
+
+## Global-motion pre-warp math (C1)
+
+`of3_gm_reduce.comp` + the CPU 6x6 solve in `src/record_impl.inc` +
+`of3_gm_prewarp.comp` estimate the per-frame camera affine and remove it before
+the dense flow search, so the search only sees object-only residual motion (kills
+fast-pan "melt"). The math is **reimplemented from published sources** (equations
+only — no code from LSFG, any `wnfg_*` blob, GameScope, or any NC-licensed
+source):
+
+| Idea | Source |
+|---|---|
+| Inverse-compositional Lucas-Kanade image alignment (6-param affine H = Σ SD·SDᵀ, b = Σ SD·e, template-gradient steepest-descent images, W ← W ∘ W(Δp)⁻¹ update) | Baker & Matthews, "Lucas-Kanade 20 Years On", IJCV 2004 (CMU-RI TR 2001) |
+| Parametric image alignment / affine warp background | Szeliski, "Computer Vision: Algorithms and Applications", §6.2 |
+| Huber M-estimator (robustify the fit against foreground/occlusion) | Huber, 1964 (standard robust least-squares) |
+| Bilinear affine image resample (the pre-warp itself) | Szeliski, §3.6 |
+
+Implementation notes: the LK runs at 1/8-res luma; the GPU only **accumulates**
+the normal equations (no float atomics — each of a fixed set of threads writes its
+own partial sum, the CPU sums in double and does the Cholesky solve, so it is
+portable to bare GLSL on Turnip/Adreno); the solve is **decoupled** (reads back a
+reduce SSBO the present ring already fence-waited → no mid-frame GPU stall) and
+runs one Gauss-Newton step per frame warm-started from the running estimate. The
+prewarp removes the affine and `of3_expand(_m4)` composes it back, so an identity
+(or disengaged) affine makes the whole pipeline **byte-identical to pre-C1** — the
+bail-to-identity path can never be worse than "no pre-warp".
 
 ## Host layer & tooling — win-fg's own code
 
@@ -70,9 +98,16 @@ Written from these open, permissively-licensed references:
 [ real prev frame ]   [ real curr frame ]
         │                     │
         ▼                     ▼
-  of3_luma → of3_downsample → of3_flow → of3_expand      (FSR3 optical flow, MIT)
-        │
-        ▼   flowFwd (curr→prev) + flowBwd (prev→curr) + confidence
+  of3_luma → of3_downsample ─┬─────────────────────────────────────────────┐
+        │                    │                                              │
+        │            of3_gm_reduce (1/8 res) → SSBO → CPU 6x6 LK solve      │  C1 global-motion
+        │                    │            (affine, decoupled/stall-free)    │  pre-warp (MIT, ours)
+        │                    ▼                                              │
+        │            of3_gm_prewarp: stabilize curr luma (remove camera) ◄──┘
+        ▼                    │
+  of3_flow (on prev + STABILIZED curr → object-only residual) → of3_expand   (FSR3 optical flow, MIT)
+        │                                        ▲ adds the global affine back
+        ▼   flowFwd (curr→prev) + flowBwd (prev→curr) + confidence  (full = global + residual)
         │
       wfg_synth      warp + importance blend + consistency gate      (written here, MIT)
         │

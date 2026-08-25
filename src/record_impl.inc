@@ -1,13 +1,26 @@
 // win-fg — FrameGen::record() and its lazy per-size descriptor/UBO setup.
 // Included from framegen.cpp (has access to FrameGen privates). Written for
 // win-fg; standard Vulkan compute wiring, no third-party code.
-
-// Optical flow is solved only from this pyramid level down (0 = full res). Full-
-// res per-pixel SAD is far too expensive on mobile, so we solve at 1/4 res
-// (level 2) and let of3_expand bilinear-upscale to display resolution — the flow
-// vectors are already in full-res pixel units at every level. This is the single
-// biggest perf lever; raise for more detail, lower for more speed.
-static const int kFlowFinest = 2;
+//
+// ── C1 GLOBAL-MOTION PRE-WARP (this file wires it end to end) ─────────────────
+// The dense SAD flow search melts on fast camera pans because the global motion
+// saturates its window. C1 estimates the per-frame camera affine with a cheap
+// inverse-compositional Lucas-Kanade solve (of3_gm_reduce accumulates the 6x6
+// normal equations at 1/8 res → CPU 6x6 Cholesky here), then of3_gm_prewarp
+// removes it from the curr luma pyramid BEFORE the search, so the search only
+// sees small, coherent, object-only residual motion. of3_expand(_m4) composes
+// the global affine back so wfg_synth is unchanged and the final warp is correct.
+//
+// DECOUPLED (stall-free) SCHEDULING: a true in-frame CPU solve would need a
+// mid-frame GPU submit+readback stall — unacceptable on a GPU-bound title. So we
+// read back the reduce SSBO the caller ALREADY fence-waited (its ring slot from a
+// couple of presents ago) and run ONE Gauss-Newton step per frame, warm-started
+// from the running estimate. Camera motion is temporally smooth, so a ~1-2 frame
+// old affine is an excellent predictor; and because the SAME affine is removed
+// (prewarp) and added back (expand), the result is EXACT for any affine we pick —
+// an approximate/stale one only changes how much residual the search must absorb,
+// never correctness. Identity affine ⇒ byte-identical to the pre-C1 pipeline, so
+// the bail-to-identity safety path can never be worse than "no pre-warp".
 
 namespace {
 struct ScratchState {
@@ -15,10 +28,19 @@ struct ScratchState {
     VkBuffer synthUbo = VK_NULL_HANDLE; VkDeviceMemory synthUboMem = VK_NULL_HANDLE; void* synthUboPtr = nullptr;
     std::vector<VkBuffer> flowUbo; std::vector<VkDeviceMemory> flowUboMem; std::vector<void*> flowUboPtr;
     VkBuffer expandUbo = VK_NULL_HANDLE; VkDeviceMemory expandUboMem = VK_NULL_HANDLE; void* expandUboPtr = nullptr;
+    // C1: per-slot global-motion UBO (double-buffered by ring slot so a live GPU
+    // read is never overwritten by the next frame — see the header note).
+    VkBuffer gmUbo[winfg::FrameGen::kGmSlots]{};
+    VkDeviceMemory gmUboMem[winfg::FrameGen::kGmSlots]{};
+    void* gmUboPtr[winfg::FrameGen::kGmSlots]{};
     // persistent descriptor sets
     VkDescriptorSet sLumaCurr = VK_NULL_HANDLE, sLumaPrev = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> sDownA, sDownB, sFlow;
-    VkDescriptorSet sExpand = VK_NULL_HANDLE, sSynth = VK_NULL_HANDLE;
+    VkDescriptorSet sExpand[winfg::FrameGen::kGmSlots]{};   // per-slot (binds gmUbo[slot])
+    VkDescriptorSet sSynth = VK_NULL_HANDLE;
+    // C1: per-slot reduce set + per-slot per-level prewarp sets
+    VkDescriptorSet sGmReduce[winfg::FrameGen::kGmSlots]{};
+    std::vector<VkDescriptorSet> sGmPrewarp[winfg::FrameGen::kGmSlots]; // sized kLevels; [kFlowFinest..) used
     VkExtent2D builtFor{0,0};
     bool built = false;
     bool flowInited = false;   // flow images laid out once, then persist (temporal predictor)
@@ -65,6 +87,63 @@ static void wUbo(const winfg::DeviceDispatch* dd, VkDevice dev, VkDescriptorSet 
     w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w.pBufferInfo = &bi;
     dd->UpdateDescriptorSets(dev, 1, &w, 0, nullptr);
 }
+static void wSsbo(const winfg::DeviceDispatch* dd, VkDevice dev, VkDescriptorSet set, uint32_t binding,
+                  VkBuffer buf, VkDeviceSize range) {
+    VkDescriptorBufferInfo bi{}; bi.buffer = buf; bi.range = range;
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set; w.dstBinding = binding; w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo = &bi;
+    dd->UpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+}
+
+// ── C1 CPU-side linear algebra (clean-room, textbook) ────────────────────────
+// 6x6 symmetric positive-definite solve via Cholesky. Returns false if not PD
+// (a bad/ill-conditioned frame → caller bails to identity). Damped by the caller.
+static bool cholSolve6(double A[6][6], const double b[6], double x[6]) {
+    double L[6][6] = {{0}};
+    for (int i = 0; i < 6; ++i) {
+        for (int j = 0; j <= i; ++j) {
+            double s = A[i][j];
+            for (int k = 0; k < j; ++k) s -= L[i][k] * L[j][k];
+            if (i == j) {
+                if (s <= 1e-20) return false;      // not positive-definite
+                L[i][j] = std::sqrt(s);
+            } else {
+                L[i][j] = s / L[j][j];
+            }
+        }
+    }
+    double y[6];
+    for (int i = 0; i < 6; ++i) { double s = b[i]; for (int k = 0; k < i; ++k) s -= L[i][k]*y[k]; y[i] = s / L[i][i]; }
+    for (int i = 5; i >= 0; --i) { double s = y[i]; for (int k = i+1; k < 6; ++k) s -= L[k][i]*x[k]; x[i] = s / L[i][i]; }
+    return true;
+}
+// affine <-> params. params p=(p1,p2,p3,p4,p5,p6); M = I + [[p1,p3,p5],[p2,p4,p6]].
+static void affFromParams(const double p[6], double M[3][3]) {
+    M[0][0]=1.0+p[0]; M[0][1]=p[2];     M[0][2]=p[4];
+    M[1][0]=p[1];     M[1][1]=1.0+p[3]; M[1][2]=p[5];
+    M[2][0]=0.0;      M[2][1]=0.0;      M[2][2]=1.0;
+}
+static void paramsFromAff(const double M[3][3], double p[6]) {
+    p[0]=M[0][0]-1.0; p[2]=M[0][1]; p[4]=M[0][2];
+    p[1]=M[1][0];     p[3]=M[1][1]-1.0; p[5]=M[1][2];
+}
+static bool invAff(const double M[3][3], double out[3][3]) {
+    double a=M[0][0], b=M[0][1], tx=M[0][2], c=M[1][0], d=M[1][1], ty=M[1][2];
+    double det = a*d - b*c;
+    if (std::fabs(det) < 1e-12) return false;
+    double id = 1.0/det;
+    out[0][0]= d*id;  out[0][1]= -b*id; out[0][2]= (b*ty - d*tx)*id;
+    out[1][0]= -c*id; out[1][1]= a*id;  out[1][2]= (c*tx - a*ty)*id;
+    out[2][0]=0.0; out[2][1]=0.0; out[2][2]=1.0;
+    return true;
+}
+static void mulAff(const double A[3][3], const double B[3][3], double out[3][3]) {
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 3; ++j)
+            out[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j];
+    out[2][0]=0.0; out[2][1]=0.0; out[2][2]=1.0;
+}
 
 namespace winfg {
 
@@ -74,22 +153,128 @@ static bool ensureScratch(FrameGen* fg, const DeviceDispatch* dd, VkDevice dev,
                           const VkPhysicalDeviceMemoryProperties& mp, VkDescriptorPool pool,
                           VkSampler samp, VkExtent2D ext,
                           std::vector<FrameGen::Img>& pyrA, std::vector<FrameGen::Img>& pyrB,
+                          std::vector<FrameGen::Img>& pyrAs,
                           std::vector<FrameGen::Img>& flowLvl, FrameGen::Img& expA, FrameGen::Img& expB,
                           const FrameGen::Pipe& pLuma, const FrameGen::Pipe& pDown,
                           const FrameGen::Pipe& pFlow, const FrameGen::Pipe& pExpand,
-                          const FrameGen::Pipe& pSynth, int kLevels, const Config& cfg);
+                          const FrameGen::Pipe& pSynth, const FrameGen::Pipe& pGmReduce,
+                          const FrameGen::Pipe& pGmPrewarp, VkBuffer* gmSsbo,
+                          int kLevels, const Config& cfg);
+
+// ── C1: read back one reduce SSBO, run one inverse-compositional LK step ──────
+// Updates the running/applied global affine. Returns whether GM engages this frame.
+bool FrameGen::updateGlobalMotion(uint32_t gmSlot, VkExtent2D fullExtent) {
+    ++gmFrames_;
+    if (!gmBuffersReady_ || cfg_.gmMode == 2 /*off*/) {
+        // off: keep identity applied; keep estimating cheaply is pointless when off.
+        gmEngaged_ = false; gmStableCount_ = 0;
+        // still refresh the linearization record so a live switch to auto starts clean
+        for (int i = 0; i < 6; ++i) gmRun_[i] = 0.0;
+        for (int i = 0; i < 6; ++i) gmLinAt_[gmSlot][i] = gmRun_[i];
+        gmLastTransPx_ = 0.0f;
+        return false;
+    }
+
+    bool good = false;
+    if (gmSlotValid_[gmSlot]) {
+        const float* pt = (const float*)gmSsboPtr_[gmSlot];
+        double sums[32]; for (int k = 0; k < 32; ++k) sums[k] = 0.0;
+        for (int t = 0; t < kGmThreads; ++t) {
+            const float* row = pt + (size_t)t * kGmStride;
+            for (int k = 0; k < kGmStride; ++k) sums[k] += (double)row[k];
+        }
+        double coverage = sums[27];
+        // require a few percent of the level's pixels as inliers
+        double lvlpx = double((fullExtent.width >> kGmLevel) * (fullExtent.height >> kGmLevel));
+        double minCov = 0.03 * (lvlpx > 0 ? lvlpx : 1.0);
+        if (coverage > minCov && coverage > 64.0) {
+            double H[6][6]; int idx = 0;
+            for (int r = 0; r < 6; ++r) for (int c = r; c < 6; ++c) { H[r][c] = H[c][r] = sums[idx]; ++idx; }
+            double b[6]; for (int i = 0; i < 6; ++i) b[i] = sums[21 + i];
+            // Levenberg damping for conditioning (relative + tiny absolute).
+            for (int i = 0; i < 6; ++i) H[i][i] += 1e-3 * H[i][i] + 1e-9;
+            double dp[6];
+            if (cholSolve6(H, b, dp)) {
+                // reject wild steps (something non-affine / a scene cut)
+                bool bounded = std::fabs(dp[0]) < 0.5 && std::fabs(dp[1]) < 0.5 &&
+                               std::fabs(dp[2]) < 0.5 && std::fabs(dp[3]) < 0.5 &&
+                               std::fabs(dp[4]) < 0.25 && std::fabs(dp[5]) < 0.25;
+                if (bounded) {
+                    // IC update: M_new = M_lin ∘ W(dp)^-1  (compose onto the SLOT's
+                    // linearization base, which is what this reduce linearized around).
+                    double Mlin[3][3], Md[3][3], Mdi[3][3], Mnew[3][3];
+                    affFromParams(gmLinAt_[gmSlot], Mlin);
+                    affFromParams(dp, Md);
+                    if (invAff(Md, Mdi)) {
+                        mulAff(Mlin, Mdi, Mnew);
+                        double pnew[6]; paramsFromAff(Mnew, pnew);
+                        // final sanity clamp on the composed estimate
+                        bool sane = std::fabs(pnew[0]) < 0.6 && std::fabs(pnew[1]) < 0.6 &&
+                                    std::fabs(pnew[2]) < 0.6 && std::fabs(pnew[3]) < 0.6 &&
+                                    std::fabs(pnew[4]) < 0.5 && std::fabs(pnew[5]) < 0.5;
+                        if (sane) { for (int i = 0; i < 6; ++i) gmRun_[i] = pnew[i]; good = true; gmHaveEst_ = true; }
+                    }
+                }
+            }
+        }
+    }
+
+    if (good) ++gmStableCount_; else gmStableCount_ = 0;
+
+    // engage policy
+    switch (cfg_.gmMode) {
+        case 1: gmEngaged_ = gmHaveEst_; break;                 // on
+        case 2: gmEngaged_ = false; break;                      // off (unreachable; handled above)
+        default: gmEngaged_ = (gmStableCount_ >= 3); break;     // auto: 3 consecutive good solves
+    }
+
+    // record the linearization base for the reduce we are about to dispatch into
+    // this slot this frame (i.e. the current running estimate).
+    for (int i = 0; i < 6; ++i) gmLinAt_[gmSlot][i] = gmRun_[i];
+    gmSlotValid_[gmSlot] = true;   // this frame's reduce will (re)write it
+
+    gmLastTransPx_ = (float)std::sqrt(
+        (gmRun_[4]*fullExtent.width) * (gmRun_[4]*fullExtent.width) +
+        (gmRun_[5]*fullExtent.height) * (gmRun_[5]*fullExtent.height));
+    return gmEngaged_;
+}
 
 void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView currView,
-                      VkImageView outView, float alpha) {
+                      VkImageView outView, float alpha, uint32_t gmSlot) {
     if (!valid()) return;
+    if (gmSlot >= (uint32_t)kGmSlots) gmSlot = 0;
     const bool m4 = (cfg_.model == 4);
     const Pipe& flowP   = m4 ? pFlowM4_   : pFlow_;
     const Pipe& expandP = m4 ? pExpandM4_ : pExpand_;
 
     if (!g_scratch.built || g_scratch.builtFor.width != extent_.width || g_scratch.builtFor.height != extent_.height) {
         ensureScratch(this, dd_, device_, memProps_, descPool_, linear_, extent_,
-                      pyrA_, pyrB_, flowLvl_, flowExpA_, flowExpB_,
-                      pLuma_, pDown_, flowP, expandP, pSynth_, kLevels, cfg_);
+                      pyrA_, pyrB_, pyrAs_, flowLvl_, flowExpA_, flowExpB_,
+                      pLuma_, pDown_, flowP, expandP, pSynth_, pGmReduce_, pGmPrewarp_,
+                      gmSsbo_, kLevels, cfg_);
+    }
+
+    // ── C1: solve the global-motion affine (reads the SSBO the caller fence-waited) ──
+    bool gmEngaged = updateGlobalMotion(gmSlot, extent_);
+    // Build this slot's GMUBO from the running / applied affine.
+    if (g_scratch.gmUboPtr[gmSlot]) {
+        GMUBO g{};
+        g.lin[0]=(float)gmRun_[0]; g.lin[1]=(float)gmRun_[1]; g.lin[2]=(float)gmRun_[2]; g.lin[3]=(float)gmRun_[3];
+        g.linT[0]=(float)gmRun_[4]; g.linT[1]=(float)gmRun_[5]; g.linT[2]=gmEngaged?1.0f:0.0f; g.linT[3]=0.0f;
+        if (gmEngaged) {
+            g.app[0]=(float)gmRun_[0]; g.app[1]=(float)gmRun_[1]; g.app[2]=(float)gmRun_[2]; g.app[3]=(float)gmRun_[3];
+            g.appT[0]=(float)gmRun_[4]; g.appT[1]=(float)gmRun_[5];
+        } // else app/appT stay 0 -> identity -> prewarp/expand are pre-C1 no-ops
+        std::memcpy(g_scratch.gmUboPtr[gmSlot], &g, sizeof(g));
+    }
+    // Log engage state + estimated global translation periodically (tag win-fg).
+    {
+        static int lastEng = -1;
+        if (gmEngaged != (lastEng == 1) || (gmFrames_ % 300ull) == 0) {
+            WFG_LOGI("C1 global-motion: engaged=%d mode=%d stable=%d transPx=%.1f (model=%d)",
+                     gmEngaged ? 1 : 0, cfg_.gmMode, gmStableCount_, gmLastTransPx_, cfg_.model);
+            lastEng = gmEngaged ? 1 : 0;
+        }
     }
 
     // update UBOs for this frame
@@ -117,6 +302,7 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     // GENERAL, not UNDEFINED).
     for (auto& i : pyrA_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     for (auto& i : pyrB_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    for (int l = kFlowFinest; l < kLevels; ++l) barrier(cmd, pyrAs_[l].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cmd, flowExpA_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cmd, flowExpB_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     // Reset the flow field to zero every frame. The coarsest level uses it as its
@@ -151,13 +337,34 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
         disp(pDown_, g_scratch.sDownB[l - 1], levelExtent(extent_, l));
         bar(pyrA_[l]); bar(pyrB_[l]);
     }
-    // 3) coarse->fine flow (only down to kFlowFinest — reduced res for perf)
+    // 2b) C1: LK normal-equation reduce (fixed grid, 1/8-res) → this slot's SSBO.
+    //     Reads raw prev/curr luma at kGmLevel; writes per-thread partials. A
+    //     compute→host barrier makes the write visible to the CPU readback that
+    //     happens when this slot comes round again (~1-2 frames later).
+    if (gmBuffersReady_ && g_scratch.sGmReduce[gmSlot]) {
+        dd_->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pGmReduce_.pipeline);
+        dd_->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pGmReduce_.layout, 0, 1, &g_scratch.sGmReduce[gmSlot], 0, nullptr);
+        dd_->CmdDispatch(cmd, (uint32_t)(kGmThreads / 64), 1, 1);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        dd_->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    // 2c) C1: pre-warp curr luma pyramid by the applied affine → stabilized pyramid
+    //     (identity affine ⇒ exact copy, so the flow below is unchanged when
+    //     disengaged). The dense flow reads pyrAs from here on.
+    for (int l = kFlowFinest; l < kLevels; ++l) {
+        disp(pGmPrewarp_, g_scratch.sGmPrewarp[gmSlot][l], levelExtent(extent_, l));
+        bar(pyrAs_[l]);
+    }
+    // 3) coarse->fine flow (only down to kFlowFinest — reduced res for perf).
+    //    Curr input is now the STABILIZED pyramid (pyrAs), wired in ensureScratch.
     for (int l = kLevels - 1; l >= kFlowFinest; --l) {
         disp(flowP, g_scratch.sFlow[l], levelExtent(extent_, l));
         bar(flowLvl_[l]);
     }
-    // 4) expand finest solved flow -> fwd/bwd (+conf), bilinear-upscaled to full res
-    disp(expandP, g_scratch.sExpand, levelExtent(extent_, 0));
+    // 4) expand finest solved flow -> fwd/bwd (+conf), + C1 global-motion add-back.
+    disp(expandP, g_scratch.sExpand[gmSlot], levelExtent(extent_, 0));
     bar(flowExpA_); bar(flowExpB_);
     // 5) synthesise interpolated frame
     disp(pSynth_, g_scratch.sSynth, levelExtent(extent_, 0));
@@ -168,13 +375,15 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
                           const VkPhysicalDeviceMemoryProperties& mp, VkDescriptorPool pool,
                           VkSampler samp, VkExtent2D ext,
                           std::vector<FrameGen::Img>& pyrA, std::vector<FrameGen::Img>& pyrB,
+                          std::vector<FrameGen::Img>& pyrAs,
                           std::vector<FrameGen::Img>& flowLvl, FrameGen::Img& expA, FrameGen::Img& expB,
                           const FrameGen::Pipe& pLuma, const FrameGen::Pipe& pDown,
                           const FrameGen::Pipe& pFlow, const FrameGen::Pipe& pExpand,
-                          const FrameGen::Pipe& pSynth, int kLevels, const Config& cfg) {
+                          const FrameGen::Pipe& pSynth, const FrameGen::Pipe& pGmReduce,
+                          const FrameGen::Pipe& pGmPrewarp, VkBuffer* gmSsbo,
+                          int kLevels, const Config& cfg) {
     auto& S = g_scratch;
     S = ScratchState{};
-    const auto SR = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     const auto GEN = VK_IMAGE_LAYOUT_GENERAL;
 
     makeUbo(dd, dev, mp, sizeof(SynthUBO), S.synthUbo, S.synthUboMem, S.synthUboPtr);
@@ -184,6 +393,11 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
     for (int l = 0; l < kLevels; ++l) {
         makeUbo(dd, dev, mp, sizeof(FlowUBO), S.flowUbo[l], S.flowUboMem[l], S.flowUboPtr[l]);
         if (S.flowUboPtr[l]) { FlowUBO u{cfg.flowScale, (uint32_t)l, 0.6f, 1.6f}; std::memcpy(S.flowUboPtr[l], &u, sizeof(u)); }
+    }
+    // C1: per-slot GMUBO (initialised to identity)
+    for (int s = 0; s < FrameGen::kGmSlots; ++s) {
+        makeUbo(dd, dev, mp, sizeof(GMUBO), S.gmUbo[s], S.gmUboMem[s], S.gmUboPtr[s]);
+        if (S.gmUboPtr[s]) { GMUBO g{}; std::memcpy(S.gmUboPtr[s], &g, sizeof(g)); }
     }
 
     // luma sets (external src wired per frame; dst is pyramid[0])
@@ -203,24 +417,54 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
         wImg(dd, dev, S.sDownB[l-1], 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, pyrB[l].view, VK_NULL_HANDLE, GEN);
     }
 
-    // flow sets (fixed): predictor = coarser flow level, or self at coarsest
+    // flow sets (fixed): predictor = coarser flow level, or self at coarsest.
+    // C1: the CURR input (binding 33) is the STABILIZED pyramid pyrAs for the
+    // solved flow levels; prev stays raw. Below kFlowFinest the level is never
+    // dispatched, so leaving those at raw curr is harmless.
     S.sFlow.resize(kLevels);
     for (int l = 0; l < kLevels; ++l) {
         S.sFlow[l] = allocSet(dd, dev, pool, pFlow.setLayout);
         int pred = (l + 1 < kLevels) ? l + 1 : l;
+        VkImageView currLvl = (l >= FrameGen::kFlowFinest) ? pyrAs[l].view : pyrA[l].view;
         wUbo(dd, dev, S.sFlow[l], 0, S.flowUbo[l], sizeof(FlowUBO));
         wImg(dd, dev, S.sFlow[l], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pyrB[l].view, samp, GEN);
-        wImg(dd, dev, S.sFlow[l], 33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pyrA[l].view, samp, GEN);
+        wImg(dd, dev, S.sFlow[l], 33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, currLvl, samp, GEN);
         wImg(dd, dev, S.sFlow[l], 34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[pred].view, samp, GEN);
         wImg(dd, dev, S.sFlow[l], 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, flowLvl[l].view, VK_NULL_HANDLE, GEN);
     }
 
-    // expand set (fixed)
-    S.sExpand = allocSet(dd, dev, pool, pExpand.setLayout);
-    wUbo(dd, dev, S.sExpand, 0, S.expandUbo, sizeof(FlowUBO));
-    wImg(dd, dev, S.sExpand, 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[kFlowFinest].view, samp, GEN);
-    wImg(dd, dev, S.sExpand, 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expA.view, VK_NULL_HANDLE, GEN);
-    wImg(dd, dev, S.sExpand, 49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expB.view, VK_NULL_HANDLE, GEN);
+    // C1: reduce sets (one per slot) — prev/curr raw luma at kGmLevel + SSBO + GMUBO.
+    if (gmSsbo) {
+        for (int s = 0; s < FrameGen::kGmSlots; ++s) {
+            if (!gmSsbo[s]) continue;
+            S.sGmReduce[s] = allocSet(dd, dev, pool, pGmReduce.setLayout);
+            wUbo (dd, dev, S.sGmReduce[s], 1,  S.gmUbo[s], sizeof(GMUBO));
+            wSsbo(dd, dev, S.sGmReduce[s], 16, gmSsbo[s], VK_WHOLE_SIZE);
+            wImg (dd, dev, S.sGmReduce[s], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pyrB[FrameGen::kGmLevel].view, samp, GEN); // prev = template
+            wImg (dd, dev, S.sGmReduce[s], 33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pyrA[FrameGen::kGmLevel].view, samp, GEN); // curr = image
+        }
+    }
+
+    // C1: prewarp sets (one per slot, per solved flow level) — raw curr in, stabilized out.
+    for (int s = 0; s < FrameGen::kGmSlots; ++s) {
+        S.sGmPrewarp[s].assign(kLevels, VK_NULL_HANDLE);
+        for (int l = FrameGen::kFlowFinest; l < kLevels; ++l) {
+            S.sGmPrewarp[s][l] = allocSet(dd, dev, pool, pGmPrewarp.setLayout);
+            wUbo(dd, dev, S.sGmPrewarp[s][l], 1,  S.gmUbo[s], sizeof(GMUBO));
+            wImg(dd, dev, S.sGmPrewarp[s][l], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pyrA[l].view, samp, GEN);
+            wImg(dd, dev, S.sGmPrewarp[s][l], 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, pyrAs[l].view, VK_NULL_HANDLE, GEN);
+        }
+    }
+
+    // expand sets (one per slot): flow inputs fixed; binding 1 = that slot's GMUBO.
+    for (int s = 0; s < FrameGen::kGmSlots; ++s) {
+        S.sExpand[s] = allocSet(dd, dev, pool, pExpand.setLayout);
+        wUbo(dd, dev, S.sExpand[s], 0, S.expandUbo, sizeof(FlowUBO));
+        wUbo(dd, dev, S.sExpand[s], 1, S.gmUbo[s], sizeof(GMUBO));
+        wImg(dd, dev, S.sExpand[s], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[FrameGen::kFlowFinest].view, samp, GEN);
+        wImg(dd, dev, S.sExpand[s], 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expA.view, VK_NULL_HANDLE, GEN);
+        wImg(dd, dev, S.sExpand[s], 49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expB.view, VK_NULL_HANDLE, GEN);
+    }
 
     // synth set: external prev/curr/out wired per frame; flow inputs fixed
     S.sSynth = allocSet(dd, dev, pool, pSynth.setLayout);
