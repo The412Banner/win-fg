@@ -16,6 +16,15 @@ struct Config {
     int      model       = 4;      // 3 = symmetric flow, 4 = bidir + occlusion gate
     int      multiplier  = 2;      // generated presents per real present + 1
     float    flowScale   = 1.0f;   // scales solved flow magnitude
+    // Async-compute scheduling. Runs the flow+synth graph on a SEPARATE compute
+    // queue (reserved at vkCreateDevice) so it can overlap the game's next-frame
+    // graphics work instead of serialising on the graphics/present queue. 0 = auto
+    // (engage iff a spare compute queue was obtained), 1 = force-on (attempt +
+    // prefer engaging), 2 = force-off (always use the synchronous path). This is a
+    // device-creation-time decision for the queue reservation; when no spare queue
+    // exists (e.g. Turnip/Adreno exposing one family with queueCount==1) the layer
+    // falls back cleanly to the synchronous path with no regression.
+    int      asyncMode   = 0;      // 0 auto, 1 on, 2 off  (WIN_FG_ASYNC=auto|on|off)
     // synthesis (wfg_synth) tuning
     float    beta        = 8.0f;   // softmax sharpness on importance Z
     float    lambda      = 0.6f;   // FB-consistency vs photometric weight
@@ -57,6 +66,15 @@ static inline int envi(const char* k, int d) {
     const char* v = std::getenv(k); return v ? std::atoi(v) : d;
 }
 
+// "auto"/"on"/"off" (also true/false/on/off numerics) -> asyncMode {0 auto,1 on,2 off}.
+static inline int parse_async_mode(const std::string& v, int dflt) {
+    if (v.empty()) return dflt;
+    if (v == "auto") return 0;
+    if (v == "on"  || v == "1" || v == "force" || v == "true"  || v == "yes") return 1;
+    if (v == "off" || v == "0" || v == "false" || v == "no")                  return 2;
+    return dflt;
+}
+
 // key=value TOML-lite reader (flat keys, '#' comments) — enough for our knobs.
 static inline void apply_toml(Config& c, const std::string& path) {
     std::ifstream f(path);
@@ -73,6 +91,7 @@ static inline void apply_toml(Config& c, const std::string& path) {
         if      (k == "enabled")    c.enabled = (v == "1" || v == "true");
         else if (k == "model")      c.model = std::atoi(v.c_str());
         else if (k == "multiplier") c.multiplier = std::atoi(v.c_str());
+        else if (k == "async")      c.asyncMode = parse_async_mode(v, c.asyncMode);
         else if (k == "flowScale")  c.flowScale = std::strtof(v.c_str(), nullptr);
         else if (k == "beta")       c.beta = std::strtof(v.c_str(), nullptr);
         else if (k == "lambda")     c.lambda = std::strtof(v.c_str(), nullptr);
@@ -107,6 +126,7 @@ static inline Config load_config() {
     c.enabled    = envi("WIN_FG_ENABLE", 0) != 0;
     c.model      = envi("WIN_FG_MODEL", c.model);
     c.multiplier = envi("WIN_FG_MULT", c.multiplier);
+    if (const char* a = std::getenv("WIN_FG_ASYNC")) c.asyncMode = parse_async_mode(a, c.asyncMode);
     c.flowScale  = envf("WIN_FG_FLOWSCALE", c.flowScale);
     c.beta       = envf("WIN_FG_BETA", c.beta);
     c.lambda     = envf("WIN_FG_LAMBDA", c.lambda);

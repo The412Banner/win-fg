@@ -33,8 +33,8 @@ struct DeviceState {
     VkPhysicalDevice phys = VK_NULL_HANDLE;
     const InstanceDispatch* id = nullptr;
     VkPhysicalDeviceMemoryProperties memProps{};
-    VkQueue queue = VK_NULL_HANDLE;
-    uint32_t queueFamily = 0;
+    VkQueue queue = VK_NULL_HANDLE;         // graphics/present queue (app's) — sync-path submits + present-side transfers
+    uint32_t queueFamily = 0;               // == gfxFamily
     FrameGen fg;
     Config cfg;
     VkCommandPool cmdPool = VK_NULL_HANDLE;
@@ -42,6 +42,15 @@ struct DeviceState {
     std::string confPath;          // guest conf.toml, watched for live hot-reload
     long long confMtime = 0;
     bool resetPrev = false;        // set on any conf change -> recapture prev frame
+
+    // ── async compute (separate queue reserved at vkCreateDevice) ──────────────
+    uint32_t gfxFamily = 0;                 // family the app renders/presents on
+    VkQueue  computeQueue = VK_NULL_HANDLE; // reserved async-compute queue (VK_NULL if none)
+    uint32_t computeFamily = 0;
+    uint32_t computeQueueIndex = 0;
+    bool     asyncAvail = false;            // a spare compute queue was obtained
+    int      asyncStrategy = 0;             // 0 none, 1 dedicated compute family, 2 second queue in gfx+compute family
+    bool     concurrentSharing = false;     // computeFamily != gfxFamily -> owned shared images must be CONCURRENT
 };
 
 // Returns the conf.toml mtime (0 if absent).
@@ -62,13 +71,56 @@ struct FrameCtx {
     bool submitted = false;
 };
 
+// ── async-compute frame-insertion (deferred-gen pipeline) ────────────────────
+// The synth runs on a separate compute queue so it can overlap the game's NEXT
+// frame's graphics work. To keep the graphics/present queue from ever stalling on
+// the current synth (which would defeat the overlap), the generated frame is
+// deferred by ONE real frame: at cycle i we START synth(i-1,i) on the compute
+// queue and PRESENT the gen frame computed last cycle (already done). Real frames
+// are presented immediately with no added latency; only the interpolated frame is
+// one cycle "stale" (smooth, no judder). The compute queue only ever touches our
+// OWNED images (never the swapchain), so no swapchain sharing change is needed;
+// the two owned image classes that cross the graphics<->compute family boundary
+// (srcImg copies, outImg gen targets) are created CONCURRENT to avoid QFOT.
+struct AsyncSlot {
+    VkCommandBuffer cmdG = VK_NULL_HANDLE;    // graphics: copy curr, blit gen->spare, present transitions
+    VkCommandBuffer cmdC = VK_NULL_HANDLE;    // compute: synth + prev update
+    VkSemaphore copyForCurr = VK_NULL_HANDLE; // cmdG -> cmdC (curr copy ready to sample)
+    VkSemaphore genReady  = VK_NULL_HANDLE;   // cmdG -> present(gen)
+    VkSemaphore realReady = VK_NULL_HANDLE;   // cmdG -> present(real)
+    VkSemaphore acquireSem = VK_NULL_HANDLE;  // acquire(spare) -> cmdG
+    VkFence gFence = VK_NULL_HANDLE;
+    VkFence cFence = VK_NULL_HANDLE;
+};
+struct AsyncCtx {
+    bool ready = false;
+    VkCommandPool gPool = VK_NULL_HANDLE;     // gfxFamily pool
+    VkCommandPool cPool = VK_NULL_HANDLE;     // computeFamily pool
+    // ping-pong owned images (2). srcImg[s] = owned copy of a real frame (CONCURRENT);
+    // outImg[s] = the gen target the synth writes (CONCURRENT). computeDone[s] ties a
+    // finished outImg[s] to the next cycle's graphics blit.
+    VkImage srcImg[2]{}; VkDeviceMemory srcMem[2]{}; VkImageView srcView[2]{};
+    VkImage outImg[2]{}; VkDeviceMemory outMem[2]{}; VkImageView outView[2]{};
+    VkSemaphore computeDone[2]{};
+    bool outValid[2] = {false, false};
+    // prevOwned — read+written ONLY on the compute queue, so no cross-family concern.
+    VkImage prevImg = VK_NULL_HANDLE; VkDeviceMemory prevMem = VK_NULL_HANDLE; VkImageView prevView = VK_NULL_HANDLE;
+    bool prevValid = false;
+    static const int kSlots = 3;
+    AsyncSlot slot[kSlots];
+    uint64_t cycle = 0;                        // increments per async present
+    int warmup = 0;                            // cycles since (re)start
+    VkFence prevGFence = VK_NULL_HANDLE;       // last cycle's fences — waited before reusing scratch/desc
+    VkFence prevCFence = VK_NULL_HANDLE;
+};
+
 struct SwapState {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat format{}; VkExtent2D extent{};
     std::vector<VkImage> images;
     std::vector<VkImageView> views;
 
-    // ── Phase 3 frame-insertion resources ────────────────────────────────────
+    // ── Phase 3 frame-insertion resources (synchronous path) ─────────────────
     VkImage       prevImg  = VK_NULL_HANDLE;  // owned copy of the last real frame
     VkDeviceMemory prevMem = VK_NULL_HANDLE;
     VkImageView   prevView = VK_NULL_HANDLE;
@@ -77,17 +129,28 @@ struct SwapState {
     std::vector<FrameCtx> ring;               // small ring so we don't stall every frame
     uint32_t      ringIdx  = 0;
     bool          insertReady = false;
+
+    AsyncCtx      async;                       // async-compute path resources (when a compute queue was reserved)
 };
 
-// Create an owned 2D color image + view (used for the prev-frame copy).
+// Create an owned 2D color image + view (used for the prev-frame copy and the
+// async realCopy/gen images). When shareFamilies names two DISTINCT families the
+// image is created VK_SHARING_MODE_CONCURRENT so it can be written on one queue
+// family and read on the other with no queue-family-ownership-transfer barriers
+// (the standard FG-layer choice over QFOT — see the async notes in this file).
 static bool makeOwnedImage(const DeviceDispatch& dd, const VkPhysicalDeviceMemoryProperties& mp,
                            VkDevice dev, VkExtent2D ext, VkFormat fmt, VkImageUsageFlags usage,
-                           VkImage& img, VkDeviceMemory& mem, VkImageView& view) {
+                           VkImage& img, VkDeviceMemory& mem, VkImageView& view,
+                           const uint32_t* shareFamilies = nullptr, uint32_t shareCount = 0) {
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D; ci.format = fmt; ci.extent = {ext.width, ext.height, 1};
     ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL; ci.usage = usage;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (shareCount >= 2 && shareFamilies && shareFamilies[0] != shareFamilies[1]) {
+        ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        ci.queueFamilyIndexCount = shareCount; ci.pQueueFamilyIndices = shareFamilies;
+    }
     if (dd.CreateImage(dev, &ci, nullptr, &img) != VK_SUCCESS) return false;
     VkMemoryRequirements mr; dd.GetImageMemoryRequirements(dev, img, &mr);
     uint32_t idx = 0;
@@ -177,6 +240,91 @@ static void destroyInsert(SwapState& s, DeviceState& ds) {
     s.insertReady = false; s.prevValid = false;
 }
 
+// Build the async-compute resources for one swapchain (owned images + two command
+// pools + per-slot sync). Only called when a compute queue was reserved.
+static bool initAsync(SwapState& s, DeviceState& ds) {
+    AsyncCtx& a = s.async;
+    const DeviceDispatch& dd = ds.dd; VkDevice dev = ds.device;
+    const uint32_t fams[2] = { ds.gfxFamily, ds.computeFamily };
+    const uint32_t* share = ds.concurrentSharing ? fams : nullptr;
+    const uint32_t shareN = ds.concurrentSharing ? 2u : 0u;
+
+    for (int i = 0; i < 2; ++i) {
+        if (!makeOwnedImage(dd, ds.memProps, dev, s.extent, s.format,
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                a.srcImg[i], a.srcMem[i], a.srcView[i], share, shareN)) { WFG_LOGE("initAsync srcImg failed"); return false; }
+        if (!makeOwnedImage(dd, ds.memProps, dev, s.extent, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                a.outImg[i], a.outMem[i], a.outView[i], share, shareN)) { WFG_LOGE("initAsync outImg failed"); return false; }
+    }
+    // prevOwned lives entirely on the compute queue -> EXCLUSIVE is correct.
+    if (!makeOwnedImage(dd, ds.memProps, dev, s.extent, s.format,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            a.prevImg, a.prevMem, a.prevView)) { WFG_LOGE("initAsync prevImg failed"); return false; }
+
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = ds.gfxFamily;
+    if (dd.CreateCommandPool(dev, &pci, nullptr, &a.gPool) != VK_SUCCESS) { WFG_LOGE("initAsync gPool failed"); return false; }
+    pci.queueFamilyIndex = ds.computeFamily;
+    if (dd.CreateCommandPool(dev, &pci, nullptr, &a.cPool) != VK_SUCCESS) { WFG_LOGE("initAsync cPool failed"); return false; }
+
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (int i = 0; i < 2; ++i) dd.CreateSemaphore(dev, &si, nullptr, &a.computeDone[i]);
+    for (int k = 0; k < AsyncCtx::kSlots; ++k) {
+        AsyncSlot& sl = a.slot[k];
+        VkCommandBufferAllocateInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ci.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ci.commandBufferCount = 1;
+        ci.commandPool = a.gPool; dd.AllocateCommandBuffers(dev, &ci, &sl.cmdG);
+        ci.commandPool = a.cPool; dd.AllocateCommandBuffers(dev, &ci, &sl.cmdC);
+        dd.CreateSemaphore(dev, &si, nullptr, &sl.copyForCurr);
+        dd.CreateSemaphore(dev, &si, nullptr, &sl.genReady);
+        dd.CreateSemaphore(dev, &si, nullptr, &sl.realReady);
+        dd.CreateSemaphore(dev, &si, nullptr, &sl.acquireSem);
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        dd.CreateFence(dev, &fi, nullptr, &sl.gFence);
+        dd.CreateFence(dev, &fi, nullptr, &sl.cFence);
+    }
+    a.cycle = 0; a.warmup = 0; a.prevValid = false;
+    a.outValid[0] = a.outValid[1] = false;
+    a.prevGFence = VK_NULL_HANDLE; a.prevCFence = VK_NULL_HANDLE;
+    a.ready = true;
+    WFG_LOGI("async resources ready (%ux%u slots=%d concurrent=%d)", s.extent.width, s.extent.height, AsyncCtx::kSlots, ds.concurrentSharing ? 1 : 0);
+    return true;
+}
+
+static void destroyAsync(SwapState& s, DeviceState& ds) {
+    AsyncCtx& a = s.async;
+    const DeviceDispatch& dd = ds.dd; VkDevice dev = ds.device;
+    if (!a.ready && !a.gPool && !a.cPool) return;
+    if (dev && dd.DeviceWaitIdle) dd.DeviceWaitIdle(dev);
+    for (int k = 0; k < AsyncCtx::kSlots; ++k) {
+        AsyncSlot& sl = a.slot[k];
+        if (sl.copyForCurr) dd.DestroySemaphore(dev, sl.copyForCurr, nullptr);
+        if (sl.genReady)   dd.DestroySemaphore(dev, sl.genReady, nullptr);
+        if (sl.realReady)  dd.DestroySemaphore(dev, sl.realReady, nullptr);
+        if (sl.acquireSem) dd.DestroySemaphore(dev, sl.acquireSem, nullptr);
+        if (sl.gFence) dd.DestroyFence(dev, sl.gFence, nullptr);
+        if (sl.cFence) dd.DestroyFence(dev, sl.cFence, nullptr);
+        sl = AsyncSlot{};
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (a.computeDone[i]) dd.DestroySemaphore(dev, a.computeDone[i], nullptr);
+        if (a.srcView[i]) dd.DestroyImageView(dev, a.srcView[i], nullptr);
+        if (a.srcImg[i])  dd.DestroyImage(dev, a.srcImg[i], nullptr);
+        if (a.srcMem[i])  dd.FreeMemory(dev, a.srcMem[i], nullptr);
+        if (a.outView[i]) dd.DestroyImageView(dev, a.outView[i], nullptr);
+        if (a.outImg[i])  dd.DestroyImage(dev, a.outImg[i], nullptr);
+        if (a.outMem[i])  dd.FreeMemory(dev, a.outMem[i], nullptr);
+    }
+    if (a.prevView) dd.DestroyImageView(dev, a.prevView, nullptr);
+    if (a.prevImg)  dd.DestroyImage(dev, a.prevImg, nullptr);
+    if (a.prevMem)  dd.FreeMemory(dev, a.prevMem, nullptr);
+    if (a.gPool) dd.DestroyCommandPool(dev, a.gPool, nullptr);
+    if (a.cPool) dd.DestroyCommandPool(dev, a.cPool, nullptr);
+    a = AsyncCtx{};
+}
+
 template <typename T> T next_gipa(const void* pNext, VkStructureType, VkLayerFunction);
 } // namespace
 
@@ -236,7 +384,88 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     link->u.pLayerInfo = link->u.pLayerInfo->pNext;
 
     auto createDevice = (PFN_vkCreateDevice)gipa(VK_NULL_HANDLE, "vkCreateDevice");
-    VkResult r = createDevice(phys, pCreateInfo, pAlloc, pDevice);
+
+    // ── async-compute FEASIBILITY: enumerate queue families and, if a spare
+    // compute-capable queue exists, rewrite pQueueCreateInfos to reserve it BEFORE
+    // the down-chain create. Strategy (a) a DEDICATED async-compute family (COMPUTE
+    // without GRAPHICS); else (b) a 2nd queue in the graphics+compute family if the
+    // family has spare queueCount. If neither is possible (e.g. Turnip/Adreno often
+    // exposes ONE family with queueCount==1) we leave the app's request untouched
+    // and fall back to the synchronous path — no regression. ────────────────────
+    Config cfg = load_config();
+    InstanceDispatch instDisp{};
+    {
+        std::lock_guard<std::mutex> lk0(g_lock);
+        auto iit = g_inst.find(dispatch_key(phys));
+        if (iit != g_inst.end()) instDisp = iit->second;
+    }
+    uint32_t qfc = 0;
+    std::vector<VkQueueFamilyProperties> qf;
+    if (instDisp.GetPhysicalDeviceQueueFamilyProperties) {
+        instDisp.GetPhysicalDeviceQueueFamilyProperties(phys, &qfc, nullptr);
+        qf.resize(qfc);
+        instDisp.GetPhysicalDeviceQueueFamilyProperties(phys, &qfc, qf.data());
+    }
+    for (uint32_t f = 0; f < qfc; ++f)
+        WFG_LOGI("queue family %u: flags=0x%x count=%u (G=%d C=%d T=%d)", f, qf[f].queueFlags, qf[f].queueCount,
+                 (qf[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) ? 1 : 0,
+                 (qf[f].queueFlags & VK_QUEUE_COMPUTE_BIT) ? 1 : 0,
+                 (qf[f].queueFlags & VK_QUEUE_TRANSFER_BIT) ? 1 : 0);
+
+    // gfxFamily = first REQUESTED family with graphics (so index 0 is guaranteed to exist)
+    uint32_t gfxFamily = ~0u;
+    for (uint32_t k = 0; k < pCreateInfo->queueCreateInfoCount; ++k) {
+        uint32_t f = pCreateInfo->pQueueCreateInfos[k].queueFamilyIndex;
+        if (f < qfc && (qf[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { gfxFamily = f; break; }
+    }
+    if (gfxFamily == ~0u) for (uint32_t f = 0; f < qfc; ++f) if (qf[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) { gfxFamily = f; break; }
+    if (gfxFamily == ~0u) gfxFamily = 0;
+
+    int strategy = 0; uint32_t cFam = 0, cIdx = 0;
+    std::vector<VkDeviceQueueCreateInfo> qcis(pCreateInfo->pQueueCreateInfos,
+                                              pCreateInfo->pQueueCreateInfos + pCreateInfo->queueCreateInfoCount);
+    std::vector<std::vector<float>> prioStore; prioStore.reserve(qcis.size() + 2);
+    auto findReq = [&](uint32_t fam) -> int {
+        for (size_t k = 0; k < qcis.size(); ++k) if (qcis[k].queueFamilyIndex == fam) return (int)k; return -1; };
+    auto bump = [&](int at) {                 // add one queue to an existing request
+        uint32_t oldc = qcis[at].queueCount;
+        prioStore.emplace_back(qcis[at].pQueuePriorities, qcis[at].pQueuePriorities + oldc);
+        prioStore.back().push_back(1.0f);
+        qcis[at].pQueuePriorities = prioStore.back().data();
+        qcis[at].queueCount = oldc + 1;
+        return oldc; };
+    const bool wantAsync = (cfg.asyncMode != 2) && qfc > 0;
+    if (wantAsync) {
+        for (uint32_t f = 0; f < qfc && !strategy; ++f) {   // (a) dedicated compute family
+            if ((qf[f].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+                int at = findReq(f);
+                if (at < 0) {
+                    prioStore.push_back({1.0f});
+                    VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+                    q.queueFamilyIndex = f; q.queueCount = 1; q.pQueuePriorities = prioStore.back().data();
+                    qcis.push_back(q);
+                    strategy = 1; cFam = f; cIdx = 0;
+                } else if (qcis[at].queueCount < qf[f].queueCount) {
+                    cIdx = bump(at); strategy = 1; cFam = f;
+                }
+            }
+        }
+        if (!strategy && gfxFamily < qfc && (qf[gfxFamily].queueFlags & VK_QUEUE_COMPUTE_BIT)) { // (b) 2nd queue, gfx family
+            int at = findReq(gfxFamily);
+            if (at >= 0 && qcis[at].queueCount < qf[gfxFamily].queueCount) {
+                cIdx = bump(at); strategy = 2; cFam = gfxFamily;
+            }
+        }
+    }
+
+    VkDeviceCreateInfo ci = *pCreateInfo;
+    if (strategy) { ci.queueCreateInfoCount = (uint32_t)qcis.size(); ci.pQueueCreateInfos = qcis.data(); }
+    VkResult r = createDevice(phys, strategy ? &ci : pCreateInfo, pAlloc, pDevice);
+    if (r != VK_SUCCESS && strategy) {
+        WFG_LOGE("async: CreateDevice with reserved compute queue failed (r=%d) — retrying with app's queues (sync fallback)", (int)r);
+        strategy = 0;
+        r = createDevice(phys, pCreateInfo, pAlloc, pDevice);
+    }
     if (r != VK_SUCCESS) return r;
 
     DeviceState st;
@@ -263,21 +492,35 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     std::lock_guard<std::mutex> lk(g_lock);
     void* ik = dispatch_key(phys);
     st.id = &g_inst[ik];
-    st.cfg = load_config();
+    st.cfg = cfg;
     st.confPath = conf_path();
     st.confMtime = stat_mtime(st.confPath);
-    // pick a queue family with compute
-    uint32_t qfc = 0; st.id->GetPhysicalDeviceQueueFamilyProperties(phys, &qfc, nullptr);
-    std::vector<VkQueueFamilyProperties> qf(qfc);
-    st.id->GetPhysicalDeviceQueueFamilyProperties(phys, &qfc, qf.data());
-    for (uint32_t i = 0; i < qfc; ++i) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { st.queueFamily = i; break; }
-    dd.GetDeviceQueue(*pDevice, st.queueFamily, 0, &st.queue);
     st.device = *pDevice;
+
+    // graphics/present queue = gfxFamily index 0 (the family the app renders on)
+    st.gfxFamily = gfxFamily; st.queueFamily = gfxFamily;
+    dd.GetDeviceQueue(*pDevice, gfxFamily, 0, &st.queue);
+    // reserved async-compute queue (if any)
+    if (strategy) {
+        dd.GetDeviceQueue(*pDevice, cFam, cIdx, &st.computeQueue);
+        st.computeFamily = cFam; st.computeQueueIndex = cIdx;
+        st.asyncAvail = (st.computeQueue != VK_NULL_HANDLE);
+        st.asyncStrategy = strategy;
+        st.concurrentSharing = (cFam != gfxFamily);
+    }
     st.id->GetPhysicalDeviceMemoryProperties(phys, &st.memProps);
     g_dev[dispatch_key(*pDevice)] = std::move(st);
     auto& ds = g_dev[dispatch_key(*pDevice)];
-    WFG_LOGI("CreateDevice ok (enable=%d model=%d mult=%d flowScale=%.2f computeQF=%u)",
-             ds.cfg.enabled, ds.cfg.model, ds.cfg.multiplier, ds.cfg.flowScale, ds.queueFamily);
+    if (ds.asyncAvail)
+        WFG_LOGI("CreateDevice ok — ASYNC engaged: strategy=%s gfxFamily=%u computeFamily=%u qIdx=%u concurrent=%d "
+                 "(enable=%d model=%d mult=%d asyncMode=%d)",
+                 ds.asyncStrategy == 1 ? "dedicated-compute" : "2nd-queue-gfx-family",
+                 ds.gfxFamily, ds.computeFamily, ds.computeQueueIndex, ds.concurrentSharing ? 1 : 0,
+                 ds.cfg.enabled, ds.cfg.model, ds.cfg.multiplier, ds.cfg.asyncMode);
+    else
+        WFG_LOGI("CreateDevice ok — SYNC path (no spare compute queue reserved; asyncMode=%d gfxFamily=%u families=%u) "
+                 "(enable=%d model=%d mult=%d)",
+                 ds.cfg.asyncMode, ds.gfxFamily, qfc, ds.cfg.enabled, ds.cfg.model, ds.cfg.multiplier);
     return VK_SUCCESS;
 }
 
@@ -344,6 +587,11 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
         if (!st.fg.onResize(s.extent, s.format))
             WFG_LOGE("framegen onResize FAILED for %ux%u", s.extent.width, s.extent.height);
         if (!initInsert(s, st)) WFG_LOGE("initInsert failed — FG will passthrough");
+        // Build the async-compute resources only when a compute queue was reserved
+        // and async isn't force-off; otherwise the synchronous insert path is used.
+        if (st.asyncAvail && st.cfg.asyncMode != 2) {
+            if (!initAsync(s, st)) { WFG_LOGE("initAsync failed — falling back to synchronous path"); destroyAsync(s, st); }
+        }
     }
     g_swap[*pSwapchain] = std::move(s);
     return VK_SUCCESS;
@@ -354,11 +602,160 @@ extern "C" void VKAPI_CALL winfg_DestroySwapchainKHR(VkDevice device, VkSwapchai
     auto& st = g_dev[dispatch_key(device)];
     auto it = g_swap.find(swapchain);
     if (it != g_swap.end()) {
+        destroyAsync(it->second, st);
         destroyInsert(it->second, st);
         for (auto v : it->second.views) if (v) st.dd.DestroyImageView(device, v, nullptr);
         g_swap.erase(it);
     }
     st.dd.DestroySwapchainKHR(device, swapchain, pAlloc);
+}
+
+// ── async-compute deferred-gen present ───────────────────────────────────────
+// Runs the flow+synth graph on the reserved compute queue so it overlaps the
+// game's NEXT-frame graphics work. The generated frame is deferred by one real
+// frame (present the gen computed last cycle, start this cycle's gen now) so the
+// graphics/present queue never stalls on the current synth. Real frames are
+// presented immediately (no added latency); only the interpolated frame is one
+// cycle stale (smooth, no judder). Returns the real frame's present result.
+static VkResult asyncGenPresent(DeviceState& st, SwapState& s, VkQueue queue,
+                                const VkPresentInfoKHR* pPresentInfo, uint32_t idx) {
+    AsyncCtx& a = s.async;
+    const DeviceDispatch& dd = st.dd; VkDevice dev = st.device;
+
+    if (st.resetPrev) { a.warmup = 0; a.prevValid = false; a.outValid[0] = a.outValid[1] = false; st.resetPrev = false; }
+
+    const uint64_t cyc = a.cycle;
+    const int imgSlot  = (int)(cyc & 1);
+    const int prevSlot = 1 - imgSlot;
+    const int r        = (int)(cyc % AsyncCtx::kSlots);
+    AsyncSlot& sl = a.slot[r];
+
+    // Reclaim: waiting last cycle's fences guarantees (queue submission order) that
+    // ALL earlier cmdG/cmdC finished -> the ping-pong images + g_scratch descriptor
+    // sets are free to reuse and every binary semaphore signalled earlier has been
+    // consumed. This paces the pipeline to depth 1 (synth_i overlaps render_{i+1}).
+    if (a.prevGFence) dd.WaitForFences(dev, 1, &a.prevGFence, VK_TRUE, UINT64_MAX);
+    if (a.prevCFence) dd.WaitForFences(dev, 1, &a.prevCFence, VK_TRUE, UINT64_MAX);
+    dd.ResetFences(dev, 1, &sl.gFence);
+    dd.ResetFences(dev, 1, &sl.cFence);
+
+    const DeviceDispatch& D = dd;   // shorthand
+    const VkImageLayout SR = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    const VkImageLayout PS = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    const VkImageLayout TS = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    const VkImageLayout TD = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    const VkImageLayout GENl = VK_IMAGE_LAYOUT_GENERAL;
+    const VkImageLayout UND = VK_IMAGE_LAYOUT_UNDEFINED;
+    const auto ALL = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const auto CS  = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    const auto TR  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    const auto TOP = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+
+    VkImage currImg = s.images[idx];
+    VkImageCopy cp{}; cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; cp.dstSubresource = cp.srcSubresource;
+    cp.extent = {s.extent.width, s.extent.height, 1};
+
+    const bool doSynth        = a.prevValid;              // false on the very first (seed) cycle
+    const bool waitPrevCompute= a.outValid[prevSlot];    // a finished gen from last cycle is pending
+    // Acquire a spare swapchain image for the deferred gen frame (only if we have one).
+    uint32_t spareIdx = 0; bool haveSpare = false;
+    if (waitPrevCompute) {
+        VkResult acq = D.AcquireNextImageKHR(dev, s.swapchain, 2000000ull, sl.acquireSem, VK_NULL_HANDLE, &spareIdx);
+        haveSpare = (acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR) && spareIdx < s.images.size();
+    }
+    const bool doGenPresent = waitPrevCompute && haveSpare;
+
+    { static unsigned long long nIns=0, nFall=0, nCyc=0;
+      if (doGenPresent) ++nIns; else if (waitPrevCompute) ++nFall;
+      if ((++nCyc % 300ull) == 0)
+          WFG_LOGI("async present: overlap live — genInsert=%llu spareStarve=%llu (strategy=%d concurrent=%d)",
+                   nIns, nFall, st.asyncStrategy, st.concurrentSharing ? 1 : 0); }
+
+    // ── record graphics cmd: copy curr->src, restore curr, (optional) blit gen->spare ──
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    D.BeginCommandBuffer(sl.cmdG, &bi);
+    imgBarrier(D, sl.cmdG, currImg, PS, TS, 0, VK_ACCESS_TRANSFER_READ_BIT, ALL, TR);
+    imgBarrier(D, sl.cmdG, a.srcImg[imgSlot], UND, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, TOP, TR);
+    D.CmdCopyImage(sl.cmdG, currImg, TS, a.srcImg[imgSlot], TD, 1, &cp);
+    imgBarrier(D, sl.cmdG, a.srcImg[imgSlot], TD, SR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
+    imgBarrier(D, sl.cmdG, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL);
+    if (doGenPresent) {
+        VkImage spareImg = s.images[spareIdx];
+        imgBarrier(D, sl.cmdG, a.outImg[prevSlot], GENl, TS, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
+        imgBarrier(D, sl.cmdG, spareImg, UND, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, ALL, TR);
+        VkImageBlit bl{}; bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; bl.dstSubresource = bl.srcSubresource;
+        bl.srcOffsets[1] = {(int)s.extent.width,(int)s.extent.height,1}; bl.dstOffsets[1] = bl.srcOffsets[1];
+        D.CmdBlitImage(sl.cmdG, a.outImg[prevSlot], TS, spareImg, TD, 1, &bl, VK_FILTER_NEAREST);
+        imgBarrier(D, sl.cmdG, spareImg, TD, PS, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, ALL);
+    }
+    D.EndCommandBuffer(sl.cmdG);
+
+    // ── record compute cmd: synth (prev,curr)->out, then curr->prev for next cycle ──
+    D.BeginCommandBuffer(sl.cmdC, &bi);
+    if (doSynth) {
+        imgBarrier(D, sl.cmdC, a.outImg[imgSlot], UND, GENl, 0, VK_ACCESS_SHADER_WRITE_BIT, TOP, CS);
+        st.fg.record(sl.cmdC, a.prevView, a.srcView[imgSlot], a.outView[imgSlot], 0.35f);
+        imgBarrier(D, sl.cmdC, a.srcImg[imgSlot], SR, TS, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
+        imgBarrier(D, sl.cmdC, a.prevImg, SR, TD, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, TR);
+        D.CmdCopyImage(sl.cmdC, a.srcImg[imgSlot], TS, a.prevImg, TD, 1, &cp);
+        imgBarrier(D, sl.cmdC, a.prevImg, TD, SR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
+    } else {
+        // seed cycle: no prev yet -> just capture curr into prevOwned
+        imgBarrier(D, sl.cmdC, a.srcImg[imgSlot], SR, TS, 0, VK_ACCESS_TRANSFER_READ_BIT, ALL, TR);
+        imgBarrier(D, sl.cmdC, a.prevImg, UND, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, TOP, TR);
+        D.CmdCopyImage(sl.cmdC, a.srcImg[imgSlot], TS, a.prevImg, TD, 1, &cp);
+        imgBarrier(D, sl.cmdC, a.prevImg, TD, SR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
+    }
+    D.EndCommandBuffer(sl.cmdC);
+
+    // ── submit graphics cmd (signals copyForCurr for compute + present-ready sems) ──
+    {
+        std::vector<VkSemaphore> waits(pPresentInfo->pWaitSemaphores,
+                                       pPresentInfo->pWaitSemaphores + pPresentInfo->waitSemaphoreCount);
+        if (waitPrevCompute) waits.push_back(a.computeDone[prevSlot]);   // gen from last cycle is visible
+        if (doGenPresent)    waits.push_back(sl.acquireSem);
+        std::vector<VkPipelineStageFlags> ws(waits.size(), ALL);
+        VkSemaphore sigs[3]; uint32_t nsig = 0;
+        sigs[nsig++] = sl.copyForCurr; sigs[nsig++] = sl.realReady;
+        if (doGenPresent) sigs[nsig++] = sl.genReady;
+        VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        su.waitSemaphoreCount = (uint32_t)waits.size();
+        su.pWaitSemaphores = waits.empty() ? nullptr : waits.data();
+        su.pWaitDstStageMask = waits.empty() ? nullptr : ws.data();
+        su.commandBufferCount = 1; su.pCommandBuffers = &sl.cmdG;
+        su.signalSemaphoreCount = nsig; su.pSignalSemaphores = sigs;
+        D.QueueSubmit(st.queue, 1, &su, sl.gFence);
+    }
+    // ── submit compute cmd on the ASYNC queue (overlaps the game's next render) ──
+    {
+        VkPipelineStageFlags w = ALL;
+        VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        su.waitSemaphoreCount = 1; su.pWaitSemaphores = &sl.copyForCurr; su.pWaitDstStageMask = &w;
+        su.commandBufferCount = 1; su.pCommandBuffers = &sl.cmdC;
+        VkSemaphore csig = a.computeDone[imgSlot];
+        if (doSynth) { su.signalSemaphoreCount = 1; su.pSignalSemaphores = &csig; }
+        D.QueueSubmit(st.computeQueue, 1, &su, sl.cFence);
+    }
+
+    // ── present: gen (deferred, in-between) first, then the real current frame ──
+    auto presentOne = [&](VkSemaphore wait, uint32_t image) {
+        VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &wait;
+        pi.swapchainCount = 1; pi.pSwapchains = &s.swapchain; pi.pImageIndices = &image;
+        return D.QueuePresentKHR(queue, &pi);
+    };
+    if (doGenPresent) presentOne(sl.genReady, spareIdx);
+    VkResult pr = presentOne(sl.realReady, idx);
+
+    // ── advance state ─────────────────────────────────────────────────────────
+    if (doSynth)         a.outValid[imgSlot]  = true;   // computeDone[imgSlot] now pending
+    if (waitPrevCompute) a.outValid[prevSlot] = false;  // its computeDone was consumed by cmdG above
+    a.prevValid = true;                                 // prevOwned now holds this cycle's real frame
+    a.prevGFence = sl.gFence; a.prevCFence = sl.cFence;
+    if (a.warmup < 1000) ++a.warmup;
+    ++a.cycle;
+    return pr;
 }
 
 // ── present hook ─────────────────────────────────────────────────────────────
@@ -411,6 +808,16 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
         uint32_t idx = pPresentInfo->pImageIndices[0];
         auto sit = g_swap.find(sc);
         auto git = g_gen.find(sc);
+        // ── ASYNC path: run the synth on the reserved compute queue (overlaps the
+        // game's next render). Only when a compute queue was reserved, async isn't
+        // force-off, and the async resources built. Otherwise use the proven
+        // synchronous path below (no regression). ─────────────────────────────
+        if (st->asyncAvail && st->cfg.asyncMode != 2 && sit != g_swap.end()
+            && sit->second.async.ready && idx < sit->second.images.size()) {
+            static int loggedAsync = 0;
+            if (!loggedAsync) { WFG_LOGI("present: ASYNC compute path ACTIVE (strategy=%d)", st->asyncStrategy); loggedAsync = 1; }
+            return asyncGenPresent(*st, sit->second, queue, pPresentInfo, idx);
+        }
         if (sit != g_swap.end() && sit->second.insertReady && git != g_gen.end()
             && idx < sit->second.images.size()) {
             SwapState& s = sit->second;
