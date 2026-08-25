@@ -28,6 +28,8 @@ struct ScratchState {
     VkBuffer synthUbo = VK_NULL_HANDLE; VkDeviceMemory synthUboMem = VK_NULL_HANDLE; void* synthUboPtr = nullptr;
     std::vector<VkBuffer> flowUbo; std::vector<VkDeviceMemory> flowUboMem; std::vector<void*> flowUboPtr;
     VkBuffer expandUbo = VK_NULL_HANDLE; VkDeviceMemory expandUboMem = VK_NULL_HANDLE; void* expandUboPtr = nullptr;
+    // C2: flow-regularization UBO (shared by all iterations; refreshed per frame).
+    VkBuffer flowRegUbo = VK_NULL_HANDLE; VkDeviceMemory flowRegUboMem = VK_NULL_HANDLE; void* flowRegUboPtr = nullptr;
     // C1: per-slot global-motion UBO (double-buffered by ring slot so a live GPU
     // read is never overwritten by the next frame — see the header note).
     VkBuffer gmUbo[winfg::FrameGen::kGmSlots]{};
@@ -37,6 +39,10 @@ struct ScratchState {
     VkDescriptorSet sLumaCurr = VK_NULL_HANDLE, sLumaPrev = VK_NULL_HANDLE;
     std::vector<VkDescriptorSet> sDownA, sDownB, sFlow;
     VkDescriptorSet sExpand[winfg::FrameGen::kGmSlots]{};   // per-slot (binds gmUbo[slot])
+    // C2: three flow-reg sets covering every (u_in → u_out) pairing of the
+    // ping-pong. sFlowReg0: in=flowLvl_[F] (=f0), out=A. sFlowRegAB: in=A, out=B.
+    // sFlowRegBA: in=B, out=A. f0 (binding 33) = flowLvl_[F] in all three.
+    VkDescriptorSet sFlowReg0 = VK_NULL_HANDLE, sFlowRegAB = VK_NULL_HANDLE, sFlowRegBA = VK_NULL_HANDLE;
     VkDescriptorSet sSynth = VK_NULL_HANDLE;
     // C1: per-slot reduce set + per-slot per-level prewarp sets
     VkDescriptorSet sGmReduce[winfg::FrameGen::kGmSlots]{};
@@ -158,7 +164,8 @@ static bool ensureScratch(FrameGen* fg, const DeviceDispatch* dd, VkDevice dev,
                           const FrameGen::Pipe& pLuma, const FrameGen::Pipe& pDown,
                           const FrameGen::Pipe& pFlow, const FrameGen::Pipe& pExpand,
                           const FrameGen::Pipe& pSynth, const FrameGen::Pipe& pGmReduce,
-                          const FrameGen::Pipe& pGmPrewarp, VkBuffer* gmSsbo,
+                          const FrameGen::Pipe& pGmPrewarp, const FrameGen::Pipe& pFlowReg,
+                          FrameGen::Img& flowRegA, FrameGen::Img& flowRegB, VkBuffer* gmSsbo,
                           int kLevels, const Config& cfg);
 
 // ── C1: read back one reduce SSBO, run one inverse-compositional LK step ──────
@@ -251,7 +258,7 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
         ensureScratch(this, dd_, device_, memProps_, descPool_, linear_, extent_,
                       pyrA_, pyrB_, pyrAs_, flowLvl_, flowExpA_, flowExpB_,
                       pLuma_, pDown_, flowP, expandP, pSynth_, pGmReduce_, pGmPrewarp_,
-                      gmSsbo_, kLevels, cfg_);
+                      pFlowReg_, flowRegA_, flowRegB_, gmSsbo_, kLevels, cfg_);
     }
 
     // ── C1: solve the global-motion affine (reads the SSBO the caller fence-waited) ──
@@ -305,6 +312,9 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     for (int l = kFlowFinest; l < kLevels; ++l) barrier(cmd, pyrAs_[l].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cmd, flowExpA_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cmd, flowExpB_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    // C2: ping-pong scratch to GENERAL (storage writes require it; contents discarded).
+    barrier(cmd, flowRegA_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    barrier(cmd, flowRegB_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     // Reset the flow field to zero every frame. The coarsest level uses it as its
     // search predictor; carrying it across frames lets a spurious vector feed
     // forward until it diverges and melts the image (the bg/fg pause was resetting
@@ -363,6 +373,64 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
         disp(flowP, g_scratch.sFlow[l], levelExtent(extent_, l));
         bar(flowLvl_[l]);
     }
+
+    // 3b) ── C2: TV-L1 flow regularization on the finest residual field ──────────
+    // Run frIters semi-implicit TV-L1 denoising iterations on flowLvl_[kFlowFinest]
+    // (the object-only residual left by C1). flowLvl_[F] is the fixed data term f0
+    // (read, never written here); u ping-pongs A<->B; the final iterate is copied
+    // back into flowLvl_[F] so of3_expand consumes the cleaned field unchanged.
+    // Disengaged (frMode==off or frIters==0) ⇒ flowLvl_[F] untouched ⇒ byte-identical
+    // to pre-C2. Identity/zero iterations is therefore never worse than "no reg".
+    const bool frEngaged = (cfg_.frMode != 2) && (cfg_.frIters > 0);
+    if (frEngaged) {
+        const int F = kFlowFinest;
+        const VkExtent2D fe = levelExtent(extent_, F);
+        if (g_scratch.flowRegUboPtr) {
+            FlowRegUBO fu{cfg_.frDt, cfg_.frLambda, cfg_.frEdge, cfg_.frEps};
+            std::memcpy(g_scratch.flowRegUboPtr, &fu, sizeof(fu));
+        }
+        FrameGen::Img* last = nullptr;
+        for (int it = 0; it < cfg_.frIters; ++it) {
+            VkDescriptorSet set; FrameGen::Img* outImg;
+            if      (it == 0)      { set = g_scratch.sFlowReg0;  outImg = &flowRegA_; }
+            else if (it % 2 == 1)  { set = g_scratch.sFlowRegAB; outImg = &flowRegB_; }
+            else                   { set = g_scratch.sFlowRegBA; outImg = &flowRegA_; }
+            dd_->CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pFlowReg_.pipeline);
+            dd_->CmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pFlowReg_.layout, 0, 1, &set, 0, nullptr);
+            dd_->CmdDispatch(cmd, (fe.width + 15) / 16, (fe.height + 15) / 16, 1);
+            bar(*outImg);
+            last = outImg;
+        }
+        // Copy the cleaned finest flow back into flowLvl_[F] (GENERAL->GENERAL).
+        // Barrier: C2's f0 reads (SHADER_READ of flowLvl_[F]) and the last iterate
+        // write must complete before the transfer overwrites/reads.
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        dd_->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                0, 1, &mb, 0, nullptr, 0, nullptr);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {fe.width, fe.height, 1};
+        dd_->CmdCopyImage(cmd, last->image, VK_IMAGE_LAYOUT_GENERAL,
+                          flowLvl_[F].image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        VkMemoryBarrier mb2{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        dd_->CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                0, 1, &mb2, 0, nullptr, 0, nullptr);
+    }
+    {   // periodic C2 status (tag win-fg), mirrors the C1 log cadence
+        static int lastFr = -1;
+        int fe = frEngaged ? 1 : 0;
+        if (fe != lastFr || (gmFrames_ % 300ull) == 0) {
+            WFG_LOGI("C2 flow-reg: engaged=%d mode=%d iters=%d lambda=%.2f dt=%.2f edge=%.1f eps=%.3f (model=%d)",
+                     fe, cfg_.frMode, cfg_.frIters, cfg_.frLambda, cfg_.frDt, cfg_.frEdge, cfg_.frEps, cfg_.model);
+            lastFr = fe;
+        }
+    }
+
     // 4) expand finest solved flow -> fwd/bwd (+conf), + C1 global-motion add-back.
     disp(expandP, g_scratch.sExpand[gmSlot], levelExtent(extent_, 0));
     bar(flowExpA_); bar(flowExpB_);
@@ -380,7 +448,8 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
                           const FrameGen::Pipe& pLuma, const FrameGen::Pipe& pDown,
                           const FrameGen::Pipe& pFlow, const FrameGen::Pipe& pExpand,
                           const FrameGen::Pipe& pSynth, const FrameGen::Pipe& pGmReduce,
-                          const FrameGen::Pipe& pGmPrewarp, VkBuffer* gmSsbo,
+                          const FrameGen::Pipe& pGmPrewarp, const FrameGen::Pipe& pFlowReg,
+                          FrameGen::Img& flowRegA, FrameGen::Img& flowRegB, VkBuffer* gmSsbo,
                           int kLevels, const Config& cfg) {
     auto& S = g_scratch;
     S = ScratchState{};
@@ -389,6 +458,9 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
     makeUbo(dd, dev, mp, sizeof(SynthUBO), S.synthUbo, S.synthUboMem, S.synthUboPtr);
     makeUbo(dd, dev, mp, sizeof(FlowUBO), S.expandUbo, S.expandUboMem, S.expandUboPtr);
     if (S.expandUboPtr) { FlowUBO u{cfg.flowScale, 0, 0.6f, 1.6f}; std::memcpy(S.expandUboPtr, &u, sizeof(u)); }
+    // C2: flow-reg UBO (params refreshed each frame in record() for hot-reload).
+    makeUbo(dd, dev, mp, sizeof(FlowRegUBO), S.flowRegUbo, S.flowRegUboMem, S.flowRegUboPtr);
+    if (S.flowRegUboPtr) { FlowRegUBO fu{cfg.frDt, cfg.frLambda, cfg.frEdge, cfg.frEps}; std::memcpy(S.flowRegUboPtr, &fu, sizeof(fu)); }
     S.flowUbo.resize(kLevels); S.flowUboMem.resize(kLevels); S.flowUboPtr.resize(kLevels);
     for (int l = 0; l < kLevels; ++l) {
         makeUbo(dd, dev, mp, sizeof(FlowUBO), S.flowUbo[l], S.flowUboMem[l], S.flowUboPtr[l]);
@@ -464,6 +536,31 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
         wImg(dd, dev, S.sExpand[s], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[FrameGen::kFlowFinest].view, samp, GEN);
         wImg(dd, dev, S.sExpand[s], 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expA.view, VK_NULL_HANDLE, GEN);
         wImg(dd, dev, S.sExpand[s], 49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expB.view, VK_NULL_HANDLE, GEN);
+    }
+
+    // C2: flow-reg sets. F = kFlowFinest. f0 (binding 33) = flowLvl_[F] in all; luma
+    // (binding 34) = prev luma at F (pyrB) for the edge-aware weight. u_in (32) and
+    // u_out (48) alternate to realize the ping-pong (see ScratchState comment).
+    {
+        const int F = FrameGen::kFlowFinest;
+        S.sFlowReg0  = allocSet(dd, dev, pool, pFlowReg.setLayout);
+        S.sFlowRegAB = allocSet(dd, dev, pool, pFlowReg.setLayout);
+        S.sFlowRegBA = allocSet(dd, dev, pool, pFlowReg.setLayout);
+        VkDescriptorSet all3[3] = {S.sFlowReg0, S.sFlowRegAB, S.sFlowRegBA};
+        for (VkDescriptorSet s : all3) {
+            wUbo(dd, dev, s, 0,  S.flowRegUbo, sizeof(FlowRegUBO));
+            wImg(dd, dev, s, 33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[F].view, samp, GEN); // f0
+            wImg(dd, dev, s, 34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pyrB[F].view,    samp, GEN); // luma
+        }
+        // iter0: in=flowLvl_[F] (=f0), out=A
+        wImg(dd, dev, S.sFlowReg0,  32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[F].view, samp, GEN);
+        wImg(dd, dev, S.sFlowReg0,  48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          flowRegA.view,   VK_NULL_HANDLE, GEN);
+        // odd iters: in=A, out=B
+        wImg(dd, dev, S.sFlowRegAB, 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowRegA.view,   samp, GEN);
+        wImg(dd, dev, S.sFlowRegAB, 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          flowRegB.view,   VK_NULL_HANDLE, GEN);
+        // even iters (>0): in=B, out=A
+        wImg(dd, dev, S.sFlowRegBA, 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowRegB.view,   samp, GEN);
+        wImg(dd, dev, S.sFlowRegBA, 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          flowRegA.view,   VK_NULL_HANDLE, GEN);
     }
 
     // synth set: external prev/curr/out wired per frame; flow inputs fixed

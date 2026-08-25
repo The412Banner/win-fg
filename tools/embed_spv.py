@@ -8,6 +8,7 @@ SHADERS = [
     "of3_luma", "of3_downsample", "of3_flow", "of3_expand",
     "of3_flow_m4", "of3_expand_m4",
     "of3_gm_reduce", "of3_gm_prewarp",   # C1 global-motion pre-warp
+    "of3_flowreg",                        # C2 TV-L1 flow regularization
     "wfg_synth",
 ]
 

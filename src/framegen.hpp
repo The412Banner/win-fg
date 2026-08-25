@@ -79,6 +79,8 @@ private:
     Pipe pLuma_, pDown_, pFlow_, pFlowM4_, pExpand_, pExpandM4_, pSynth_;
     // C1: LK normal-equation reduce + curr-luma stabilization pre-warp
     Pipe pGmReduce_, pGmPrewarp_;
+    // C2: TV-L1 flow-regularization iteration (one dispatch per iteration)
+    Pipe pFlowReg_;
 
     // per-resolution resources
     // 7 levels (was 5): the coarsest levels set the max motion the solver can track.
@@ -92,6 +94,12 @@ private:
     std::vector<Img> pyrAs_;         // C1: STABILIZED curr luma (flow levels only)
     std::vector<Img> flowLvl_;       // per-level flow scratch
     Img flowExpA_, flowExpB_;        // fwd / bwd expanded flow (+conf)
+    // C2: TV-L1 ping-pong scratch at kFlowFinest res. flowLvl_[kFlowFinest] holds
+    // the fixed observation f0 (never written during the iterations); u ping-pongs
+    // between these two; the final iterate is copied back into flowLvl_[kFlowFinest]
+    // so of3_expand consumes the cleaned field with no binding change (⇒ skipping
+    // C2 leaves flowLvl_ byte-identical to pre-C2).
+    Img flowRegA_, flowRegB_;
 
     // ── C1 global-motion state ────────────────────────────────────────────────
     // Host-visible SSBOs the reduce shader writes per-thread partials into; the

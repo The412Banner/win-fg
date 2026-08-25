@@ -153,6 +153,8 @@ bool FrameGen::init(const DeviceDispatch* dd, const InstanceDispatch* id,
     // C1: LK-reduce (UBO, SSBO, prev, curr) and curr-luma stabilization prewarp (UBO, src, dst).
     if (!buildSetLayout(dd_, dev, {B{1,U},B{16,SB},B{32,S},B{33,S}}, pGmReduce_.setLayout)) return false;
     if (!buildSetLayout(dd_, dev, {B{1,U},B{32,S},B{48,W}}, pGmPrewarp_.setLayout)) return false;
+    // C2: flow-reg (UBO, u_in, f0_obs, luma, out).
+    if (!buildSetLayout(dd_, dev, {B{0,U},B{32,S},B{33,S},B{34,S},B{48,W}}, pFlowReg_.setLayout)) return false;
 
     std::vector<VkDescriptorType> unused;
     if (!makePipe(pLuma_,     embedded::OF3_LUMA, unused)) return false;
@@ -163,10 +165,11 @@ bool FrameGen::init(const DeviceDispatch* dd, const InstanceDispatch* id,
     if (!makePipe(pExpandM4_, embedded::OF3_EXPAND_M4, unused)) return false;
     if (!makePipe(pGmReduce_,  embedded::OF3_GM_REDUCE,  unused)) return false;
     if (!makePipe(pGmPrewarp_, embedded::OF3_GM_PREWARP, unused)) return false;
+    if (!makePipe(pFlowReg_,  embedded::OF3_FLOWREG, unused)) return false;
     if (!makePipe(pSynth_,    embedded::WFG_SYNTH, unused)) return false;
     if (!makeGmBuffers()) { WFG_LOGE("framegen: GM SSBO alloc failed — C1 disabled"); }
-    WFG_LOGI("framegen init ok (queueFamily=%u, 9 pipelines, model=%d, C1 gm=%d)",
-             queueFamily_, cfg_.model, cfg_.gmMode);
+    WFG_LOGI("framegen init ok (queueFamily=%u, 10 pipelines, model=%d, C1 gm=%d, C2 flow_reg=%d iters=%d)",
+             queueFamily_, cfg_.model, cfg_.gmMode, cfg_.frMode, cfg_.frIters);
     return true;
 }
 
@@ -182,10 +185,15 @@ bool FrameGen::onResize(VkExtent2D extent, VkFormat /*colorFormat*/) {
     for (auto& i : pyrAs_) destroyImage(i); pyrAs_.clear();
     for (auto& i : flowLvl_) destroyImage(i); flowLvl_.clear();
     destroyImage(flowExpA_); destroyImage(flowExpB_);
+    destroyImage(flowRegA_); destroyImage(flowRegB_);   // C2
     extent_ = extent; ready_ = false;
 
     const VkImageUsageFlags lumaUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
-    const VkImageUsageFlags flowUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    // flowLvl_ is cleared every frame (per-frame reset) and C2 copies the cleaned
+    // finest level back into it — both need TRANSFER_DST. The C2 ping-pong images
+    // are the copy SOURCE (TRANSFER_SRC).
+    const VkImageUsageFlags flowUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const VkImageUsageFlags regUsage  = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     pyrA_.resize(kLevels); pyrB_.resize(kLevels); flowLvl_.resize(kLevels);
     for (int l = 0; l < kLevels; ++l) {
         VkExtent2D e = levelExtent(extent, l);
@@ -199,6 +207,9 @@ bool FrameGen::onResize(VkExtent2D extent, VkFormat /*colorFormat*/) {
         if (!makeImage(pyrAs_[l], levelExtent(extent, l), VK_FORMAT_R32_SFLOAT, lumaUsage)) return false;
     if (!makeImage(flowExpA_, extent, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
     if (!makeImage(flowExpB_, extent, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
+    // C2: TV-L1 ping-pong scratch at the finest solved flow level (1/4-res).
+    if (!makeImage(flowRegA_, levelExtent(extent, kFlowFinest), VK_FORMAT_R16G16B16A16_SFLOAT, regUsage)) return false;
+    if (!makeImage(flowRegB_, levelExtent(extent, kFlowFinest), VK_FORMAT_R16G16B16A16_SFLOAT, regUsage)) return false;
     ready_ = true;
     WFG_LOGI("framegen resized to %ux%u (%d pyramid levels)", extent.width, extent.height, kLevels);
     return true;
@@ -231,9 +242,11 @@ void FrameGen::destroy() {
     for (auto& i : pyrAs_) destroyImage(i); pyrAs_.clear();
     for (auto& i : flowLvl_) destroyImage(i); flowLvl_.clear();
     destroyImage(flowExpA_); destroyImage(flowExpB_);
+    destroyImage(flowRegA_); destroyImage(flowRegB_);   // C2
     destroyPipe(pLuma_); destroyPipe(pDown_); destroyPipe(pFlow_); destroyPipe(pFlowM4_);
     destroyPipe(pExpand_); destroyPipe(pExpandM4_); destroyPipe(pSynth_);
     destroyPipe(pGmReduce_); destroyPipe(pGmPrewarp_);
+    destroyPipe(pFlowReg_);   // C2
     for (int s = 0; s < kGmSlots; ++s) {
         if (gmSsboMem_[s]) dd_->UnmapMemory(device_, gmSsboMem_[s]);
         if (gmSsbo_[s]) dd_->DestroyBuffer(device_, gmSsbo_[s], nullptr);

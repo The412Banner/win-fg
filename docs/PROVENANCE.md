@@ -28,6 +28,7 @@ principles. Full FidelityFX attribution in
 | Occlusion-gated expand | `shaders/of3_expand_m4.comp` | our extension of the above (+ C1 global-motion add-back) | MIT (ours) |
 | **Global-motion LK reduce (C1)** | `shaders/of3_gm_reduce.comp` | **written from first principles** (inverse-compositional LK normal equations) | MIT (ours) |
 | **Global-motion pre-warp (C1)** | `shaders/of3_gm_prewarp.comp` | **written from first principles** (affine image warp) | MIT (ours) |
+| **Flow regularization (C2)** | `shaders/of3_flowreg.comp` | **written from first principles** (TV-L1 smoothness prior, semi-implicit) | MIT (ours) |
 | **Frame synthesis** | `shaders/wfg_synth.comp` | **written from first principles** | MIT (ours) |
 
 ## Synthesis math
@@ -58,6 +59,45 @@ source):
 |---|---|
 | Inverse-compositional Lucas-Kanade image alignment (6-param affine H = Σ SD·SDᵀ, b = Σ SD·e, template-gradient steepest-descent images, W ← W ∘ W(Δp)⁻¹ update) | Baker & Matthews, "Lucas-Kanade 20 Years On", IJCV 2004 (CMU-RI TR 2001) |
 | Parametric image alignment / affine warp background | Szeliski, "Computer Vision: Algorithms and Applications", §6.2 |
+
+## Flow regularization math (C2)
+
+`of3_flowreg.comp` applies a variational **TV-L1 smoothness prior** to the dense
+flow field left by C1 (the object-only residual at `flowLvl_[kFlowFinest]`, 1/4-res).
+It suppresses incoherent / spurious per-block vectors while **preserving true
+motion discontinuities** (object silhouettes) — an L1 data term + edge-aware
+Total-Variation regularizer, minimising
+
+    min_u   Σ  g(x)·|∇u(x)|   +   λ·|u(x) − f0(x)|
+
+where `u` is the regularized flow, `f0` the raw SAD flow (fixed data term), `|∇u|`
+the Total-Variation (L1-of-gradient) term, and `g(x)∈(0,1]` a luma-gradient
+edge-stop weight. The math is **reimplemented from published sources** (equations
+only — no code from LSFG, any `wnfg_*` blob, GameScope, or any NC-licensed source):
+
+| Idea | Source |
+|---|---|
+| TV-L1 optical-flow energy + L1 data soft-threshold (thresholding step) | Zach, Pock & Bischof, "A Duality Based Approach for Realtime TV-L1 Optical Flow", DAGM 2007 |
+| Primal-dual TV framework | Chambolle & Pock, "A First-Order Primal-Dual Algorithm for Convex Problems…", JMIV 2011 |
+| Total-Variation (ROF) regularization | Rudin, Osher & Fatemi, "Nonlinear total variation based noise removal", Physica D 1992 |
+| Lagged-diffusivity / semi-implicit TV solver (the scheme actually used) | Vogel & Oman 1996; Chan, Golub & Mulet, SIAM J. Sci. Comput. 1999 |
+| Edge-aware (image-gradient) weighting of the smoothness term | Perona & Malik 1990; Nagel & Enkelmann 1986; Weickert 1998 |
+| L2 smoothness baseline this L1 variant deliberately replaces | Horn & Schunck, 1981 |
+
+**Scheme note.** The textbook Chambolle-Pock primal-dual keeps a persistent dual
+field and uses step sizes `(σ,τ)` that must satisfy `στL²≤1` or it diverges — a
+tuning-sensitive instability we avoid on Turnip, and one that breaks the
+one-shader / ping-pong-two-flow-images contract (it needs extra dual images).
+`of3_flowreg.comp` solves the **same energy** with a lagged-diffusivity
+semi-implicit (Jacobi) step: the optimal TV dual `p = g·∇u/|∇u|_ε` (which has
+`|p|≤1` by construction) is re-derived in closed form each iteration, the primal
+update is a convex combination of the centre and its neighbours — **unconditionally
+stable for any dt>0, never NaN** — followed by the exact L1 data-term
+soft-threshold `u = uDiff − clamp(uDiff−f0, −θ, θ)`, `θ = dt·λ`. Only `u` is
+carried between iterations (ping-pong two rgba16f flow images), N iterations.
+Runs at `kFlowFinest` (1/4-res); the cleaned finest flow is copied back in place,
+so `of3_expand`'s 5-tap median + C1 global-motion add-back consume it unchanged.
+**0 iterations ⇒ flow field untouched ⇒ byte-identical to pre-C2.**
 | Huber M-estimator (robustify the fit against foreground/occlusion) | Huber, 1964 (standard robust least-squares) |
 | Bilinear affine image resample (the pre-warp itself) | Szeliski, §3.6 |
 
@@ -105,7 +145,12 @@ Written from these open, permissively-licensed references:
         │                    ▼                                              │
         │            of3_gm_prewarp: stabilize curr luma (remove camera) ◄──┘
         ▼                    │
-  of3_flow (on prev + STABILIZED curr → object-only residual) → of3_expand   (FSR3 optical flow, MIT)
+  of3_flow (on prev + STABILIZED curr → object-only residual)                 (FSR3 optical flow, MIT)
+        │
+  of3_flowreg  ── C2: TV-L1 smoothness prior on the residual (N iters, 1/4-res) ── (MIT, ours)
+        │        kills spurious vectors, keeps object edges sharp; identity ⇒ pre-C2
+        ▼
+  of3_expand   (5-tap median → confidence gate → C1 global-motion add-back)    (FSR3 scale, MIT)
         │                                        ▲ adds the global affine back
         ▼   flowFwd (curr→prev) + flowBwd (prev→curr) + confidence  (full = global + residual)
         │

@@ -23,6 +23,21 @@ struct Config {
     // 2 = off (never pre-warp; identity affine → pipeline == pre-C1 exactly).
     // WIN_FG_GM=auto|on|off  /  conf.toml global_motion=auto|on|off.
     int      gmMode      = 0;      // 0 auto, 1 on, 2 off
+    // C2 FLOW REGULARIZATION (TV-L1 smoothness prior). After C1 removes the camera
+    // motion, the dense flow (flowLvl_ at kFlowFinest, 1/4-res) is the OBJECT-only
+    // residual; it still carries spurious per-block vectors. C2 runs N semi-implicit
+    // TV-L1 denoising iterations on that field — an L1 data term + edge-aware Total-
+    // Variation regularizer — to kill incoherent vectors while KEEPING true motion
+    // discontinuities (object edges) sharp. Solved in-place; expand's median + C1
+    // add-back consume the cleaned field unchanged. 0 iterations ⇒ byte-identical to
+    // pre-C2. See shaders/of3_flowreg.comp.
+    // WIN_FG_FLOWREG=auto|on|off  /  conf.toml flow_reg=auto|on|off.
+    int      frMode      = 0;      // 0 auto (engaged), 1 on (engaged), 2 off
+    int      frIters     = 4;      // TV-L1 iterations at kFlowFinest (0 ⇒ off)
+    float    frLambda    = 2.0f;   // L1 data-fidelity weight (higher ⇒ trust SAD flow)
+    float    frDt        = 0.25f;  // semi-implicit smoothing step (higher ⇒ smoother)
+    float    frEdge      = 8.0f;   // luma-gradient edge sensitivity for the TV weight g
+    float    frEps       = 0.05f;  // Charbonnier epsilon (px) for the TV diffusivity
     // synthesis (wfg_synth) tuning
     float    beta        = 8.0f;   // softmax sharpness on importance Z
     float    lambda      = 0.6f;   // FB-consistency vs photometric weight
@@ -53,6 +68,12 @@ struct Config {
         if (model < 3) model = 3; if (model > 4) model = 4;
         if (multiplier < 2) multiplier = 2; if (multiplier > 4) multiplier = 4;
         if (gmMode < 0) gmMode = 0; if (gmMode > 2) gmMode = 2;
+        if (frMode < 0) frMode = 0; if (frMode > 2) frMode = 2;
+        if (frIters < 0) frIters = 0; if (frIters > 16) frIters = 16;
+        if (frLambda < 0.0f) frLambda = 0.0f;
+        if (frDt < 0.01f) frDt = 0.01f; if (frDt > 4.0f) frDt = 4.0f;
+        if (frEdge < 0.0f) frEdge = 0.0f;
+        if (frEps < 1e-3f) frEps = 1e-3f;
         if (flowScale < 0.05f) flowScale = 0.05f; if (flowScale > 4.0f) flowScale = 4.0f;
         if (beta < 0.0f) beta = 0.0f; if (lambda < 0.0f) lambda = 0.0f;
     }
@@ -91,6 +112,12 @@ static inline void apply_toml(Config& c, const std::string& path) {
         else if (k == "model")      c.model = std::atoi(v.c_str());
         else if (k == "multiplier") c.multiplier = std::atoi(v.c_str());
         else if (k == "global_motion") c.gmMode = parse_tristate(v, c.gmMode);
+        else if (k == "flow_reg")   c.frMode = parse_tristate(v, c.frMode);
+        else if (k == "fr_iters")   c.frIters = std::atoi(v.c_str());
+        else if (k == "fr_lambda")  c.frLambda = std::strtof(v.c_str(), nullptr);
+        else if (k == "fr_dt")      c.frDt = std::strtof(v.c_str(), nullptr);
+        else if (k == "fr_edge")    c.frEdge = std::strtof(v.c_str(), nullptr);
+        else if (k == "fr_eps")     c.frEps = std::strtof(v.c_str(), nullptr);
         else if (k == "flowScale")  c.flowScale = std::strtof(v.c_str(), nullptr);
         else if (k == "beta")       c.beta = std::strtof(v.c_str(), nullptr);
         else if (k == "lambda")     c.lambda = std::strtof(v.c_str(), nullptr);
@@ -126,6 +153,12 @@ static inline Config load_config() {
     c.model      = envi("WIN_FG_MODEL", c.model);
     c.multiplier = envi("WIN_FG_MULT", c.multiplier);
     if (const char* g = std::getenv("WIN_FG_GM")) c.gmMode = parse_tristate(g, c.gmMode);
+    if (const char* r = std::getenv("WIN_FG_FLOWREG")) c.frMode = parse_tristate(r, c.frMode);
+    c.frIters    = envi("WIN_FG_FR_ITERS", c.frIters);
+    c.frLambda   = envf("WIN_FG_FR_LAMBDA", c.frLambda);
+    c.frDt       = envf("WIN_FG_FR_DT", c.frDt);
+    c.frEdge     = envf("WIN_FG_FR_EDGE", c.frEdge);
+    c.frEps      = envf("WIN_FG_FR_EPS", c.frEps);
     c.flowScale  = envf("WIN_FG_FLOWSCALE", c.flowScale);
     c.beta       = envf("WIN_FG_BETA", c.beta);
     c.lambda     = envf("WIN_FG_LAMBDA", c.lambda);
@@ -172,6 +205,15 @@ struct GMUBO {
     float linT[4];  // tx,ty, engaged, pad
     float app[4];   // p1,p2,p3,p4
     float appT[4];  // tx,ty, pad, pad
+};
+
+// C2 flow-regularization UBO — MUST match binding 0 (vec4 params) in
+// of3_flowreg.comp. std140: one vec4 = 16 bytes. See Config::fr* fields.
+struct FlowRegUBO {
+    float dt;         // params.x — semi-implicit smoothing step
+    float lambda;     // params.y — L1 data-fidelity weight (θ = dt·lambda)
+    float edgeAlpha;  // params.z — luma-gradient edge sensitivity for g
+    float epsTV;      // params.w — Charbonnier epsilon (px) for the TV diffusivity
 };
 
 } // namespace winfg

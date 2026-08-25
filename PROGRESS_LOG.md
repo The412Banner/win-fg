@@ -1,4 +1,35 @@
 
+## 2026-08-25 — C2 FLOW REGULARIZATION (TV-L1 smoothness prior) implemented (branch feat/c2-flow-regularization, off feat/c1-global-motion-prewarp @ f841efc)
+- Cleans the LEFTOVER OBJECT flow that C1 leaves behind. C1 removes the CAMERA motion at
+  the source; C2 denoises the object-only residual (flowLvl_[kFlowFinest], 1/4-res) with a
+  variational TV-L1 prior: L1 data term + edge-aware Total-Variation regularizer. Kills
+  incoherent/spurious per-block vectors while KEEPING true motion discontinuities (object
+  silhouettes) sharp — L1/TV, not H-S's L2 which would over-smooth the edges. ROADMAP T3-A.
+- New shader `of3_flowreg.comp` = ONE regularization iteration; N iterations ping-pong two
+  rgba16f flow images. Scheme is a lagged-diffusivity SEMI-IMPLICIT (Jacobi) TV-L1 solve,
+  NOT textbook Chambolle-Pock primal-dual: same energy, but unconditionally stable for any
+  dt>0 (primal is a convex combo of centre+neighbours ⇒ never NaN/diverges), no persistent
+  dual images, one-shader/ping-pong contract kept. Turnip-safe by construction. The optimal
+  TV dual p=g·∇u/|∇u|_ε (|p|≤1) is re-derived closed-form each iter; L1 data step is the
+  exact soft-threshold u = uDiff − clamp(uDiff−f0, −θ, θ), θ=dt·λ (branchless). Edge weight
+  g=exp(−edgeAlpha·|∇I|) from prev luma at the flow level ⇒ respects object boundaries.
+  (Zach-Pock-Bischof 2007; Chambolle-Pock 2011; ROF 1992; Vogel-Oman 1996 / Chan-Mulet 1999
+  for the solver; Perona-Malik / Weickert for the edge weight; H-S 1981 baseline.)
+- ORDERING: slots AFTER of3_flow and BEFORE of3_expand. f0 (data term) = flowLvl_[F], read
+  every iter, NEVER written; u ping-pongs flowRegA_↔flowRegB_; final iterate copied back into
+  flowLvl_[F] (GENERAL→GENERAL vkCmdCopyImage, barriered) so of3_expand's binding is unchanged.
+  Effective order = TV-L1 (C2) THEN expand's existing 5-tap median (final speckle scrub — L1
+  is already outlier-robust, so no destructive double-smooth). Composes with C1: C2 cleans the
+  RESIDUAL; expand still adds the global affine back → end-to-end flow correct. 0 iters / off ⇒
+  flowLvl_[F] untouched ⇒ BYTE-IDENTICAL to pre-C2 (bail is never worse).
+- Knobs (user tweaks after): `WIN_FG_FLOWREG` env / `flow_reg=auto|on|off` (default auto=on);
+  `fr_iters` (default 4), `fr_lambda` (2.0), `fr_dt` (0.25), `fr_edge` (8.0), `fr_eps` (0.05)
+  — env WIN_FG_FR_ITERS/LAMBDA/DT/EDGE/EPS. Iteration count is the primary cost knob. Logs
+  (tag win-fg) engage+iters+knobs in `framegen init` and every 300 frames.
+- Cost: N tiny dispatches at 1/4-res (~57k px @720p, ~5 flow + 5 luma fetches each) + 1 image
+  copy; est. ~0.05–0.15 ms/frame at 4 iters. New images: flowRegA_/flowRegB_ (2× rgba16f @
+  1/4-res, ~0.5 MB each @720p). CI-green target; NOT device-proven (owner's next step).
+
 ## 2026-08-25 — C1 GLOBAL-MOTION PRE-WARP implemented (branch feat/c1-global-motion-prewarp, off feat/quality-tier2 @ a1ca5e6)
 - Attacks the settled root cause below (flow SATURATION on fast camera motion → oil-paint
   melt) at its source: estimate the per-frame camera AFFINE with inverse-compositional
