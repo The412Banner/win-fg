@@ -116,3 +116,29 @@
    (the MCFI/OBMC coherence lever).
 3. Product decision for 3.0: ship the conservative soft-but-stable FG honestly, or keep
    win-fg experimental/passthrough until coherence pass lands. FG on main is passthrough.
+
+---
+
+## 🔖 CHECKPOINT 2026-08-26 — v0.2 shipped; Route-B data pipeline built
+
+**Shipped:** win-fg **v0.2** released (tag `v0.2`, .so+manifest assets). Quality stack —
+anti-ghost (quality-tier2) + **C1 global-motion prewarp** (LK affine; device-proven "feels
+great" + logcat engaged) + **C2 TV-L1 flow-reg** (semi-implicit lagged-diffusivity; device
+"runs great") — all merged to `master` (`0381044`) and baked into Bannerlator `main` with
+model-3 as default. (The stale "FG on main is passthrough" note above is superseded — real
+2× insertion since Phase-3b; now the full quality stack.)
+
+**Route-B (own AI weights) — data pipeline BUILT:**
+- `feat/capture-mode` (`9f22ff26`, .so `4b31e07f`): dev-only training capture — real
+  pre-interpolation swapchain frames → lossless **QOI** `.wfgcap` containers + `manifest.jsonl`
+  + anonymous consent block. Gated `WIN_FG_CAPTURE`/`capture=` (default off, zero overhead).
+  Knobs: dir, mode(patch/frame), W/H, patches, motion, shard_mb. NOT merged to master.
+- App side (Bannerlator `feat/winfg-training-capture`): toggle + "I understand" consent +
+  720p/1080p/Match-game resolution picker + "?" help dialog; shareable pubg APK staged for
+  crowdsourced footage collection.
+- Kaggle token verified (curl/urllib REST, CLI won't build here); GPU needs phone-verify.
+
+**NEXT:** user records PoC footage (good-motion games, stable FPS) → train tiny VFI residual
+on Kaggle (warm-start RIFE MIT, fine-tune on our captures) → convert FP16 + inference shaders
+→ hot-swap. Classical polish after: **C4 (occlusion/edge blend) before C3 (cost-volume/refine)**.
+Parked: async-compute (wrong tool for GPU-bound). Open bug: Fold-8/Adreno-840/Wrapper crash.
