@@ -135,6 +135,18 @@ Watch `logcat -s win-fg` for `capture ON …` and periodic `capture rate: …` l
 Exact container byte layout + how to reconstruct triplets offline are documented in
 `src/capture.hpp`.
 
+**Consent attestation (anonymous):** every container header **and** the first line
+of `manifest.jsonl` carry a consent record proving the data was willingly created
+and shared under agreed terms. **No PII.** The app supplies it via env
+`WIN_FG_CAPTURE_CONSENT` (compact `consent_version|epochMs|anonUUID|appVer|model|agreed`)
+and/or a `consent.json` object dropped in the capture root; the layer normalizes it
+to a canonical JSON object (`consent_version`, `ts_ms`, `anon_uuid`, `app_ver`,
+`model`, `agreed`, `source`). If **no** consent is present at capture time, capture
+still runs but is flagged `consent: null` (container `consent_len=0`; manifest
+`{"record":"consent","consent":null}`) so a consent-less file is never silently
+trusted. The consent block is written into **every** shard so it can't be separated
+from the data. Byte layout in `src/capture.hpp`.
+
 ## Roadmap
 
 - ✅ **Done (v0.2):** anti-ghost, C1 global-motion pre-warp, C2 TV-L1 flow-reg,

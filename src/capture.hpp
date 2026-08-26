@@ -20,16 +20,33 @@
 // Everything is LOSSLESS (raw RGBA8 → QOI, a lossless codec). NEVER a lossy video
 // codec — compression artifacts would ruin the training data.
 //
+// ── CONSENT ATTESTATION ───────────────────────────────────────────────────────
+// Every container + manifest carries an anonymous consent record proving the data
+// was willingly created and shared under agreed terms. NO PII. The Bannerlator app
+// supplies it via env WIN_FG_CAPTURE_CONSENT (compact
+//   consent_version|epochMs|anonUUID|appVer|model|agreed) and/or a consent.json
+// file dropped in the capture root. layer.cpp normalizes either into a single JSON
+// object string that this engine embeds in TWO places: the container file header
+// (below) and the FIRST line of manifest.jsonl. If no consent is present at capture
+// time we STILL capture but flag it null (header consent_len=0; manifest
+// {"record":"consent","consent":null}) so a consent-less file is never silently
+// trusted. Canonical object fields: consent_version, ts_ms, anon_uuid, app_ver,
+// model, agreed(bool), source.
+//
 // ── .wfgcap CONTAINER BYTE LAYOUT (all little-endian) ─────────────────────────
-//   File header (40 bytes):
+//   File header (fixed 40 bytes):
 //     char magic[8] = "WFGCAP01"
-//     u32 version    (=1)
+//     u32 version    (=2 — v2 adds the consent block below; v1 had none)
 //     u32 mode       (0 = patch/triplet, 1 = frame)
 //     u32 patch      (patch edge in downscaled px; 0 in frame mode)
 //     u32 dstW, dstH (downscaled frame dims)
 //     u32 srcW, srcH (original swapchain dims)
 //     u32 reserved   (=0)
-//   Then a stream of self-describing records:
+//   Consent block (immediately after the fixed header, repeated in EVERY shard so
+//   it can't be separated from the data):
+//     u32 consent_len         (0 ⇒ no consent / null)
+//     u8  consent[consent_len] (UTF-8 canonical JSON object; absent iff len==0)
+//   Then, starting at offset 44 + consent_len, a stream of self-describing records:
 //     Record header (32 bytes):
 //       u8  type     (0 patch, 1 frame)
 //       u8  nblobs   (patch: #coords; frame: 1)
@@ -128,6 +145,7 @@ struct CaptureConfig {
     int         srcW = 0, srcH = 0;   // original swapchain res
     int         dstW = 0, dstH = 0;   // downscaled res (buffer dims)
     uint64_t    shardCapBytes = 1024ull * 1024 * 1024;
+    std::string consent;              // canonical JSON object, or empty ⇒ null/no consent
 };
 
 // One downscaled real frame handed over from the present thread.
@@ -167,6 +185,11 @@ public:
         manifest_ = std::fopen(mp.c_str(), "wb");
         if (!manifest_) { WFG_LOGE("capture: cannot open manifest %s", mp.c_str()); return false; }
         if (!open_shard(0)) { std::fclose(manifest_); manifest_ = nullptr; return false; }
+        // FIRST manifest line = consent attestation (null if none supplied).
+        if (cfg_.consent.empty())
+            std::fprintf(manifest_, "{\"record\":\"consent\",\"consent\":null}\n");
+        else
+            std::fprintf(manifest_, "{\"record\":\"consent\",\"consent\":%s}\n", cfg_.consent.c_str());
         std::fprintf(manifest_,
             "{\"win_fg_capture\":1,\"container\":\"wfgcap01\",\"format\":\"qoi-rgba8\",\"mode\":\"%s\","
             "\"src_w\":%d,\"src_h\":%d,\"dst_w\":%d,\"dst_h\":%d,\"patch\":%d,\"patches_per_triplet\":%d,"
@@ -243,12 +266,15 @@ private:
         std::vector<uint8_t> hdr;
         const char magic[8] = {'W','F','G','C','A','P','0','1'};
         for (int i = 0; i < 8; ++i) wu8(hdr, (uint8_t)magic[i]);
-        wu32(hdr, 1);                       // version
+        wu32(hdr, 2);                       // version (2 = has consent block)
         wu32(hdr, (uint32_t)cfg_.mode);
         wu32(hdr, (uint32_t)(cfg_.mode == 0 ? cfg_.patchSize : 0));
         wu32(hdr, (uint32_t)cfg_.dstW); wu32(hdr, (uint32_t)cfg_.dstH);
         wu32(hdr, (uint32_t)cfg_.srcW); wu32(hdr, (uint32_t)cfg_.srcH);
         wu32(hdr, 0);                       // reserved
+        // consent block (0-len ⇒ null); repeated in every shard so it travels with the data
+        wu32(hdr, (uint32_t)cfg_.consent.size());
+        for (char c : cfg_.consent) wu8(hdr, (uint8_t)c);
         std::fwrite(hdr.data(), 1, hdr.size(), shard_);
         shardBytes_ = hdr.size();
         bytesWritten_.fetch_add(hdr.size());

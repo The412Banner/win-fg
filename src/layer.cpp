@@ -253,6 +253,50 @@ static bool makeReadbackBuffer(const DeviceDispatch& dd, const VkPhysicalDeviceM
     return dd.MapMemory(dev, mem, 0, size, 0, &ptr) == VK_SUCCESS;
 }
 
+// Minimal JSON string escape (quotes/backslash; control chars → space).
+static std::string jsonEscape(const std::string& x) {
+    std::string o; o.reserve(x.size());
+    for (char c : x) {
+        if (c == '"' || c == '\\') { o += '\\'; o += c; }
+        else if (c == '\n' || c == '\r' || c == '\t') o += ' ';
+        else o += c;
+    }
+    return o;
+}
+static bool allDigits(const std::string& s) { if (s.empty()) return false; for (char c : s) if (c < '0' || c > '9') return false; return true; }
+
+// Build the anonymous consent-attestation JSON (or empty ⇒ null). Sources, in
+// order: env WIN_FG_CAPTURE_CONSENT (compact
+// consent_version|epochMs|anonUUID|appVer|model|agreed), else consent.json in the
+// capture root. No PII — the app is responsible for supplying only anonymous fields.
+static std::string readConsent(const Config& cfg) {
+    if (const char* e = std::getenv("WIN_FG_CAPTURE_CONSENT")) {
+        std::string s = e;
+        std::vector<std::string> f; size_t start = 0;
+        for (;;) { size_t p = s.find('|', start);
+                   f.push_back(s.substr(start, p == std::string::npos ? std::string::npos : p - start));
+                   if (p == std::string::npos) break; start = p + 1; }
+        auto g = [&](size_t i){ return i < f.size() ? f[i] : std::string(); };
+        bool agreed = (g(5) == "true" || g(5) == "1" || g(5) == "yes");
+        std::string ts = g(1); if (!allDigits(ts)) ts = "0";
+        return "{\"consent_version\":\"" + jsonEscape(g(0)) + "\",\"ts_ms\":" + ts +
+               ",\"anon_uuid\":\"" + jsonEscape(g(2)) + "\",\"app_ver\":\"" + jsonEscape(g(3)) +
+               "\",\"model\":\"" + jsonEscape(g(4)) + "\",\"agreed\":" + (agreed ? "true" : "false") +
+               ",\"source\":\"env\"}";
+    }
+    std::string path = capture_root(cfg) + "/consent.json";
+    if (FILE* fp = std::fopen(path.c_str(), "rb")) {
+        std::string raw; char buf[1024]; size_t n;
+        while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0) raw.append(buf, n);
+        std::fclose(fp);
+        for (char& c : raw) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        size_t a = raw.find_first_not_of(" "); size_t b = raw.find_last_not_of(" ");
+        if (a != std::string::npos) raw = raw.substr(a, b - a + 1); else raw.clear();
+        if (!raw.empty() && raw.front() == '{' && raw.back() == '}') return raw;  // trust only a JSON object
+    }
+    return std::string();   // null / no consent supplied
+}
+
 static void destroyCapture(CaptureState& cap, DeviceState& ds) {
     const DeviceDispatch& dd = ds.dd; VkDevice dev = ds.device;
     if (dev && dd.DeviceWaitIdle) dd.DeviceWaitIdle(dev);
@@ -312,12 +356,14 @@ static bool initCapture(CaptureState& cap, DeviceState& ds, SwapState& s, const 
     cc.srcW = (int)s.extent.width; cc.srcH = (int)s.extent.height;
     cc.dstW = (int)cap.dstExtent.width; cc.dstH = (int)cap.dstExtent.height;
     cc.shardCapBytes = (uint64_t)cfg.capShardMB * 1024ull * 1024ull;
+    cc.consent = readConsent(cfg);
     if (!cap.engine.start(cc)) { WFG_LOGE("capture: engine start failed"); destroyCapture(cap, ds); return false; }
     cap.ready = true; cap.ringIdx = 0; cap.captured = 0;
-    WFG_LOGI("capture ON dir=%s mode=%s target=%ux%u (src %ux%u) patches=%d patchsz=%d motion=%.2f shard=%dMB ring=%d",
+    WFG_LOGI("capture ON dir=%s mode=%s target=%ux%u (src %ux%u) patches=%d patchsz=%d motion=%.2f shard=%dMB ring=%d consent=%s",
              cap.engine.sessionDir().c_str(), cfg.capMode == 0 ? "patch" : "frame",
              cap.dstExtent.width, cap.dstExtent.height, s.extent.width, s.extent.height,
-             cfg.capPatches, cfg.capPatchSize, cfg.capMotion, cfg.capShardMB, kCapRing);
+             cfg.capPatches, cfg.capPatchSize, cfg.capMotion, cfg.capShardMB, kCapRing,
+             cc.consent.empty() ? "null(FLAGGED)" : "present");
     return true;
 }
 
