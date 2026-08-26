@@ -84,6 +84,11 @@ struct DeviceDispatch {
     PFN_vkDestroyPipeline              DestroyPipeline = nullptr;
     PFN_vkCreateDescriptorPool         CreateDescriptorPool = nullptr;
     PFN_vkDestroyDescriptorPool        DestroyDescriptorPool = nullptr;
+    // Frees every set in the pool at once — used by FrameGen::configure() to reclaim
+    // the old scratch descriptor sets when a perf_preset change forces a live rebuild
+    // (otherwise repeated preset switches would exhaust the pool). May be null in
+    // theory; the rebuild path null-checks before calling.
+    PFN_vkResetDescriptorPool          ResetDescriptorPool = nullptr;
     PFN_vkAllocateDescriptorSets       AllocateDescriptorSets = nullptr;
     PFN_vkUpdateDescriptorSets         UpdateDescriptorSets = nullptr;
 

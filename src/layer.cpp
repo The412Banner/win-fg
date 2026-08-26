@@ -551,6 +551,7 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     L(CreateShaderModule); L(DestroyShaderModule);
     L(CreateDescriptorSetLayout); L(DestroyDescriptorSetLayout); L(CreatePipelineLayout); L(DestroyPipelineLayout);
     L(CreateComputePipelines); L(DestroyPipeline); L(CreateDescriptorPool); L(DestroyDescriptorPool);
+    L(ResetDescriptorPool);                // live perf_preset rebuild reclaims old scratch sets
     L(AllocateDescriptorSets); L(UpdateDescriptorSets);
     L(CreateCommandPool); L(DestroyCommandPool); L(AllocateCommandBuffers); L(FreeCommandBuffers);
     L(BeginCommandBuffer); L(EndCommandBuffer); L(CmdBindPipeline); L(CmdBindDescriptorSets); L(CmdDispatch);
@@ -605,8 +606,8 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
 
     g_dev[dispatch_key(*pDevice)] = std::move(st);
     auto& ds = g_dev[dispatch_key(*pDevice)];
-    WFG_LOGI("CreateDevice ok (enable=%d model=%d mult=%d flowScale=%.2f computeQF=%u)",
-             ds.cfg.enabled, ds.cfg.model, ds.cfg.multiplier, ds.cfg.flowScale, ds.queueFamily);
+    WFG_LOGI("CreateDevice ok (enable=%d model=%d mult=%d flowScale=%.2f perf_preset=%d computeQF=%u)",
+             ds.cfg.enabled, ds.cfg.model, ds.cfg.multiplier, ds.cfg.flowScale, ds.cfg.perfPreset, ds.queueFamily);
     return VK_SUCCESS;
 }
 
@@ -766,10 +767,11 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
     if (m != 0 && m != st->confMtime) {
         st->confMtime = m;
         Config nc = load_config();
-        WFG_LOGI("conf reload: enabled=%d mult=%d model=%d flow=%.2f (was enabled=%d)",
-                 nc.enabled, nc.multiplier, nc.model, nc.flowScale, st->cfg.enabled ? 1 : 0);
+        WFG_LOGI("conf reload: enabled=%d mult=%d model=%d flow=%.2f perf_preset=%d (was enabled=%d preset=%d)",
+                 nc.enabled, nc.multiplier, nc.model, nc.flowScale, nc.perfPreset,
+                 st->cfg.enabled ? 1 : 0, st->cfg.perfPreset);
         st->cfg = nc;
-        st->fg.configure(nc);
+        st->fg.configure(nc);   // recomputes kFlowFinest from perf_preset; live-rebuilds if it changed
         st->resetPrev = true;   // toggle/model/flow change -> recapture prev next frame
     }
 

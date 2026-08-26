@@ -37,6 +37,18 @@ struct Config {
     // in QueuePresentKHR stays a no-op when headroom is adequate.
     // WIN_FG_EXTRA_IMAGES / conf.toml extra_images.
     int      extraImages = 2;
+    // ── FLOW-RESOLUTION PERFORMANCE PRESET ────────────────────────────────────
+    // Trades base-FPS-drop against optical-flow quality by selecting the FINEST
+    // pyramid level the dense flow is solved at (FrameGen::kFlowFinest):
+    //   0 = Quality     -> kFlowFinest = 1 (~1/2-res flow; best motion, biggest FG cost)
+    //   1 = Balanced    -> kFlowFinest = 2 (~1/4-res; TODAY's behaviour)  [DEFAULT]
+    //   2 = Performance -> kFlowFinest = 3 (~1/8-res; cheapest -> smallest base-FPS drop)
+    // Out-of-range clamps to Balanced (1), so an unset/older conf.toml is byte-
+    // identical to today. Changing this LIVE rebuilds the affected per-size flow
+    // images (like a resize) inside the layer and resets the flow predictor, so a
+    // preset change is fully hot — no FG toggle needed. See FrameGen::configure /
+    // FrameGen::flowFinestForPreset. WIN_FG_PERF_PRESET / conf.toml perf_preset.
+    int      perfPreset  = 1;      // 0 quality, 1 balanced (default), 2 performance
     float    flowScale   = 1.0f;   // scales solved flow magnitude
     // C1 GLOBAL-MOTION PRE-WARP. Estimate the per-frame camera affine (LK) and
     // remove it before the dense SAD flow search so the search only sees coherent
@@ -120,6 +132,7 @@ struct Config {
         if (model < 3) model = 3; if (model > 4) model = 4;
         if (multiplier < 2) multiplier = 2; if (multiplier > 4) multiplier = 4;
         if (extraImages < 0) extraImages = 0; if (extraImages > 8) extraImages = 8;
+        if (perfPreset < 0 || perfPreset > 2) perfPreset = 1;   // clamp out-of-range -> Balanced
         if (gmMode < 0) gmMode = 0; if (gmMode > 2) gmMode = 2;
         if (frMode < 0) frMode = 0; if (frMode > 2) frMode = 2;
         if (frIters < 0) frIters = 0; if (frIters > 16) frIters = 16;
@@ -186,6 +199,7 @@ static inline void apply_toml(Config& c, const std::string& path) {
         else if (k == "model")      c.model = std::atoi(v.c_str());
         else if (k == "multiplier") c.multiplier = std::atoi(v.c_str());
         else if (k == "extra_images") c.extraImages = std::atoi(v.c_str());
+        else if (k == "perf_preset") c.perfPreset = std::atoi(v.c_str());
         else if (k == "global_motion") c.gmMode = parse_tristate(v, c.gmMode);
         else if (k == "flow_reg")   c.frMode = parse_tristate(v, c.frMode);
         else if (k == "fr_iters")   c.frIters = std::atoi(v.c_str());
@@ -247,6 +261,7 @@ static inline Config load_config() {
     c.model      = envi("WIN_FG_MODEL", c.model);
     c.multiplier = envi("WIN_FG_MULT", c.multiplier);
     c.extraImages = envi("WIN_FG_EXTRA_IMAGES", c.extraImages);
+    c.perfPreset  = envi("WIN_FG_PERF_PRESET", c.perfPreset);
     if (const char* g = std::getenv("WIN_FG_GM")) c.gmMode = parse_tristate(g, c.gmMode);
     if (const char* r = std::getenv("WIN_FG_FLOWREG")) c.frMode = parse_tristate(r, c.frMode);
     c.frIters    = envi("WIN_FG_FR_ITERS", c.frIters);

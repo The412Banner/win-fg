@@ -177,8 +177,10 @@ static VkExtent2D levelExtent(VkExtent2D e, int l) {
     return { e.width >> l ? e.width >> l : 1u, e.height >> l ? e.height >> l : 1u };
 }
 
-bool FrameGen::onResize(VkExtent2D extent, VkFormat /*colorFormat*/) {
-    if (ready_ && extent.width == extent_.width && extent.height == extent_.height) return true;
+bool FrameGen::onResize(VkExtent2D extent, VkFormat /*colorFormat*/, bool force) {
+    // force skips the same-extent early-out so a perf_preset change (which alters
+    // flowFinest_ and therefore the per-size flow-image resolutions) rebuilds them.
+    if (!force && ready_ && extent.width == extent_.width && extent.height == extent_.height) return true;
     // tear down previous size
     for (auto& i : pyrA_) destroyImage(i); pyrA_.clear();
     for (auto& i : pyrB_) destroyImage(i); pyrB_.clear();
@@ -203,15 +205,16 @@ bool FrameGen::onResize(VkExtent2D extent, VkFormat /*colorFormat*/) {
     }
     // C1: stabilized curr luma — only the levels the dense flow reads (finest..coarsest).
     pyrAs_.resize(kLevels);
-    for (int l = kFlowFinest; l < kLevels; ++l)
+    for (int l = flowFinest_; l < kLevels; ++l)
         if (!makeImage(pyrAs_[l], levelExtent(extent, l), VK_FORMAT_R32_SFLOAT, lumaUsage)) return false;
     if (!makeImage(flowExpA_, extent, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
     if (!makeImage(flowExpB_, extent, VK_FORMAT_R16G16B16A16_SFLOAT, flowUsage)) return false;
-    // C2: TV-L1 ping-pong scratch at the finest solved flow level (1/4-res).
-    if (!makeImage(flowRegA_, levelExtent(extent, kFlowFinest), VK_FORMAT_R16G16B16A16_SFLOAT, regUsage)) return false;
-    if (!makeImage(flowRegB_, levelExtent(extent, kFlowFinest), VK_FORMAT_R16G16B16A16_SFLOAT, regUsage)) return false;
+    // C2: TV-L1 ping-pong scratch at the finest solved flow level (perf_preset-driven res).
+    if (!makeImage(flowRegA_, levelExtent(extent, flowFinest_), VK_FORMAT_R16G16B16A16_SFLOAT, regUsage)) return false;
+    if (!makeImage(flowRegB_, levelExtent(extent, flowFinest_), VK_FORMAT_R16G16B16A16_SFLOAT, regUsage)) return false;
     ready_ = true;
-    WFG_LOGI("framegen resized to %ux%u (%d pyramid levels)", extent.width, extent.height, kLevels);
+    WFG_LOGI("framegen resized to %ux%u (%d pyramid levels, kFlowFinest=%d perf_preset=%d)",
+             extent.width, extent.height, kLevels, flowFinest_, cfg_.perfPreset);
     return true;
 }
 

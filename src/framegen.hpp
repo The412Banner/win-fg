@@ -14,9 +14,16 @@ class FrameGen {
 public:
     bool init(const DeviceDispatch* dd, const InstanceDispatch* id,
               VkPhysicalDevice phys, VkDevice dev, uint32_t queueFamily, VkQueue queue);
-    void configure(const Config& c) { cfg_ = c; cfg_.sanitize(); }
+    // Applies a new config. Recomputes the active finest flow level from
+    // cfg_.perfPreset; if it changed while resources are live, safely rebuilds the
+    // affected per-size flow images (like a resize) and resets the flow predictor,
+    // so a perf_preset change is FULLY LIVE — no FG toggle needed. Defined in
+    // record_impl.inc (needs the scratch-state teardown). See flowFinestForPreset.
+    void configure(const Config& c);
     // (Re)build per-resolution resources for a swapchain of the given size/format.
-    bool onResize(VkExtent2D extent, VkFormat colorFormat);
+    // force=true rebuilds even when the extent is unchanged (used by configure()
+    // when a perf_preset change alters the finest solved flow level).
+    bool onResize(VkExtent2D extent, VkFormat colorFormat, bool force = false);
     // Record the whole flow+synth graph into cmd. prevView/currView are SAMPLED
     // views of the two real frames; outView is a STORAGE view of the target
     // image the generated frame is written into. alpha in (0,1).
@@ -42,10 +49,26 @@ public:
     static constexpr int kGmLevel   = 3;   // 1/8-res luma pyramid level for the LK estimate
     static constexpr int kGmThreads = 512; // fixed reduce threads (8 groups * local_size_x 64)
     static constexpr int kGmStride  = 32;  // floats/thread: 21 H + 6 b + coverage + resid + pad
-    // Finest pyramid level the dense flow is solved at (0 = full res). Shared here
-    // so onResize can size the stabilized-curr pyramid and record_impl.inc can wire
-    // the flow/expand inputs; both must agree. (Was a record_impl.inc local.)
-    static constexpr int kFlowFinest = 2;
+    // Finest pyramid level the dense flow is solved at (0 = full res). This is now
+    // RUNTIME-SELECTABLE via conf.toml perf_preset (0 Quality=1 / 1 Balanced=2 /
+    // 2 Performance=3). kFlowFinestDefault is the Balanced value (today's behaviour);
+    // the ACTIVE level lives in flowFinest_ and is read through flowFinest(). onResize
+    // sizes the stabilized-curr pyramid + C2 scratch from it, and record_impl.inc
+    // wires the flow/expand inputs to it — both must agree, so they all read
+    // flowFinest()/flowFinest_ (never a hard-coded 2). (Was a static constexpr = 2.)
+    static constexpr int kFlowFinestDefault = 2;   // Balanced (perf_preset=1)
+    // Map perf_preset -> finest solved level. Out-of-range -> Balanced. A higher
+    // level = coarser (cheaper) flow = smaller base-FPS drop. configure() clamps the
+    // result against kLevels so at least two solved levels always remain.
+    static int flowFinestForPreset(int preset) {
+        switch (preset) {
+            case 0: return 1;   // Quality     ~1/2-res
+            case 2: return 3;   // Performance ~1/8-res
+            case 1: default: return kFlowFinestDefault;  // Balanced ~1/4-res (today)
+        }
+    }
+    // The ACTIVE finest solved flow level (set by configure() from perf_preset).
+    int flowFinest() const { return flowFinest_; }
 
 private:
     uint32_t findMemType(uint32_t bits, VkMemoryPropertyFlags props) const;
@@ -74,6 +97,9 @@ private:
     Config    cfg_;
     VkExtent2D extent_{};
     bool ready_ = false;
+    // ACTIVE finest solved flow level (perf_preset). Default = Balanced (today's 2)
+    // so an unconfigured engine and an unset conf.toml are byte-identical to before.
+    int  flowFinest_ = kFlowFinestDefault;
 
     // pipelines
     Pipe pLuma_, pDown_, pFlow_, pFlowM4_, pExpand_, pExpandM4_, pSynth_;
