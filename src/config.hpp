@@ -34,7 +34,9 @@ struct Config {
     // (present immediately) so worst case is one un-paced pair, never a hitch.
     // FIFO self-paces so the waits collapse to ~0 there. Off ⇒ byte-identical
     // back-to-back behaviour. WIN_FG_PACING=on|off / conf.toml pacing=on|off.
-    bool     pacing      = true;
+    // ISOLATION BUILD: default flipped to OFF to A/B the AYANEO-750 post-setting-change
+    // flicker regression against the pacing feature (everything else byte-identical).
+    bool     pacing      = false;
     int      model       = 4;      // 3 = symmetric flow, 4 = bidir + occlusion gate
     int      multiplier  = 2;      // generated presents per real present + 1
     // EXTRA SWAPCHAIN IMAGE HEADROOM (device-freeze fix). On top of the +1 spare the
