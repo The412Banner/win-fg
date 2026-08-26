@@ -18,6 +18,8 @@
 #include <atomic>
 #include <chrono>
 #include <sys/stat.h>
+#include <time.h>
+#include <cerrno>
 
 using namespace winfg;
 
@@ -46,6 +48,19 @@ struct DeviceState {
     std::string confPath;          // guest conf.toml, watched for live hot-reload
     long long confMtime = 0;
     bool resetPrev = false;        // set on any conf change -> recapture prev frame
+    // ── EVEN-CADENCE FRAME PACING state (see cfg.pacing) ──────────────────────
+    // paceDtNs  : EMA of the guest's real-frame interval (ns). 0 = not warm yet.
+    // paceLastReal : monotonic ns of the last REAL present (scheduling anchor).
+    // paceLastEntry: monotonic ns of the previous present-hook ENTRY (dt sample).
+    // paceLastWaitNs: total sleep WE injected in the previous hook, subtracted
+    //   from the next entry interval so the dt estimate tracks the GUEST's own
+    //   cadence (can shrink when base FPS rises) rather than the paced cadence.
+    double   paceDtNs      = 0.0;
+    uint64_t paceLastReal  = 0;
+    uint64_t paceLastEntry = 0;
+    uint64_t paceLastWaitNs = 0;
+    uint64_t paceLate      = 0;    // count of pacing-skip (late) events
+    uint64_t paceInserts   = 0;    // count of paced inserts (periodic summary)
 };
 
 // Returns the conf.toml mtime (0 if absent).
@@ -72,6 +87,7 @@ struct FrameCtx {
 struct SwapState {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFormat format{}; VkExtent2D extent{};
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;  // pacing note: FIFO self-paces
     std::vector<VkImage> images;
     std::vector<VkImageView> views;
     uint32_t appMinImages = 0;   // the app's ORIGINAL minImageCount (its own working
@@ -670,6 +686,7 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
     }
     if (r != VK_SUCCESS) return r;
     SwapState s; s.swapchain = *pSwapchain; s.format = pCreateInfo->imageFormat; s.extent = pCreateInfo->imageExtent;
+    s.presentMode = pCreateInfo->presentMode;   // pacing: FIFO self-paces (waits skip)
     s.appMinImages = origMin;   // reserve this many for the guest in the headroom guard
     uint32_t n = 0; st.dd.GetSwapchainImagesKHR(device, *pSwapchain, &n, nullptr);
     s.images.resize(n); st.dd.GetSwapchainImagesKHR(device, *pSwapchain, &n, s.images.data());
@@ -745,6 +762,25 @@ extern "C" void VKAPI_CALL winfg_DestroySwapchainKHR(VkDevice device, VkSwapchai
     st.dd.DestroySwapchainKHR(device, swapchain, pAlloc);
 }
 
+// ── FRAME-PACING CLOCK HELPERS (even-cadence 2x present) ──────────────────────
+// mono_ns(): monotonic wall clock in ns. sleep_until_ns(): precise, bounded,
+// CPU-only absolute sleep on the SAME clock (no GPU wait); restarts on EINTR.
+// Callers guarantee the target is bounded (≤ dt and ≤ kPaceCeilNs from now).
+static inline uint64_t mono_ns() {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static inline void sleep_until_ns(uint64_t target_ns) {
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(target_ns / 1000000000ull);
+    ts.tv_nsec = (long)  (target_ns % 1000000000ull);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {}
+}
+static const double   kPaceAlpha   = 0.10;          // EMA smoothing for dt estimate
+static const uint64_t kPaceCeilNs  = 20000000ull;   // absolute per-wait ceiling (20 ms)
+static const uint64_t kPaceMinDtNs = 500000ull;     // reject dt samples < 0.5 ms
+static const uint64_t kPaceMaxDtNs = 100000000ull;  // reject dt samples > 100 ms
+
 // ── present hook ─────────────────────────────────────────────────────────────
 // First-draft bring-up: runs the flow+synth compute for (prev,curr) into an
 // owned target to prove the pipeline end-to-end, then presents the real frame
@@ -789,6 +825,25 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
     WFG_LOGD(dbg, "P#%llu present-enter: enabled=%d mult=%d fg.valid=%d capture=%d swapCount=%u",
              presents, en, st->cfg.multiplier, st->fg.valid() ? 1 : 0,
              st->cfg.capture ? 1 : 0, pPresentInfo->swapchainCount);
+
+    // ── FRAME-PACING dt ESTIMATE ─────────────────────────────────────────────
+    // This hook runs exactly once per REAL frame, so the entry-to-entry interval
+    // measures the guest's real-frame cadence. Subtract the wait WE injected last
+    // hook (paceLastWaitNs) so the estimate tracks the GUEST's own interval — it
+    // can therefore SHRINK when the base FPS rises rather than pinning to the
+    // paced display cadence. Outlier-rejected (pause / alt-tab / warm-up).
+    // Cheap and runs regardless of enable, so dt is warm the instant FG turns on.
+    const uint64_t t_entry = mono_ns();
+    if (st->paceLastEntry != 0) {
+        long long adj = (long long)(t_entry - st->paceLastEntry) - (long long)st->paceLastWaitNs;
+        if (adj >= (long long)kPaceMinDtNs && adj <= (long long)kPaceMaxDtNs) {
+            double smp = (double)adj;
+            st->paceDtNs = (st->paceDtNs <= 0.0) ? smp
+                         : st->paceDtNs + kPaceAlpha * (smp - st->paceDtNs);
+        }
+    }
+    st->paceLastEntry  = t_entry;
+    st->paceLastWaitNs = 0;   // accumulate THIS hook's injected wait in the insert path
 
     // ── TRAINING-DATA CAPTURE (dev mode) ─────────────────────────────────────
     // Default OFF ⇒ the branch is one bool test and the present path below is
@@ -1022,12 +1077,73 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                     return ptr;
                 }
                 if (presents < 6) WFG_LOGI("2x insert live: spare=%u real=%u", spareIdx, idx);
+                if (presents < 6 && s.presentMode == VK_PRESENT_MODE_FIFO_KHR)
+                    WFG_LOGI("pacing note: swapchain is FIFO — display self-paces, pacing waits skip");
+
+                // ── EVEN-CADENCE PACING ───────────────────────────────────────
+                // Present the GENERATED frame, then hold the REAL present to its
+                // scheduled beat (paceLastReal + dt) so the generated frame lands
+                // near the temporal MIDPOINT between consecutive real frames —
+                // even gen,real,gen,real cadence instead of a clustered pair + gap.
+                // The real cadence stays locked to dt (base FPS is NOT throttled;
+                // the wait only consumes the guest's render slack). Bounds: each
+                // sleep ≤ min(dt, 20 ms); if we are already behind the beat the
+                // wait is SKIPPED (present immediately) — worst case one un-paced
+                // pair, NEVER a hitch. Pure CPU sleep (no GPU wait added). Off, or
+                // dt not warm / anchor stale (post-fallback gap) ⇒ back-to-back.
+                const uint64_t dtNs = (st->paceDtNs > 0.0) ? (uint64_t)st->paceDtNs : 0ull;
+                const bool pace = st->cfg.pacing && dtNs > 0 && st->paceLastReal != 0
+                                  && (t_entry - st->paceLastReal) <= 2ull * dtNs;  // fresh anchor only
+                const uint64_t capNs = (dtNs < kPaceCeilNs) ? dtNs : kPaceCeilNs;  // ≤ dt and ≤ 20 ms
+                const uint64_t genTarget  = st->paceLastReal + dtNs / 2;           // midpoint slot
+                const uint64_t realTarget = st->paceLastReal + dtNs;               // next real beat
+
+                // (a) GENERATED present. Nudge to the midpoint slot only if the
+                //     guest ran far enough ahead that the slot is still in the
+                //     future (needs >2x slack); otherwise present immediately.
+                uint64_t tg = mono_ns();
+                if (pace && genTarget > tg) {
+                    uint64_t gt = (genTarget > tg + capNs) ? tg + capNs : genTarget;
+                    sleep_until_ns(gt);
+                    st->paceLastWaitNs += (mono_ns() - tg);
+                }
                 WFG_LOGD(dbg, "P#%llu present-generated BEGIN (spare=%u)", presents, spareIdx);
                 VkResult pg = presentOne(fc.genSem, spareIdx, nullptr);   // generated frame: NEVER carry a present-id (may be skipped)
+                uint64_t tGenDone = mono_ns();
                 WFG_LOGD(dbg, "P#%llu present-generated DONE r=%d", presents, (int)pg);
+
+                // (b) REAL present. Hold to the scheduled beat so gen↔real end up
+                //     ~dt/2 apart; skip the wait cleanly if already late.
+                bool lateSkip = false;
+                uint64_t tr = mono_ns();
+                if (pace) {
+                    if (realTarget > tr) {
+                        uint64_t rt = (realTarget > tr + capNs) ? tr + capNs : realTarget;
+                        if (rt > tGenDone + capNs) rt = tGenDone + capNs;  // hard per-wait ceiling
+                        sleep_until_ns(rt);
+                        st->paceLastWaitNs += (mono_ns() - tr);
+                    } else {
+                        lateSkip = true; ++st->paceLate;   // pacing-skip (late): behind schedule
+                    }
+                }
                 WFG_LOGD(dbg, "P#%llu present-real BEGIN (image=%u)", presents, idx);
                 VkResult prr = presentOne(fc.currSem, idx, pPresentInfo->pNext);   // real: forward guest present-id (retires vkWaitForPresentKHR)
+                uint64_t tRealDone = mono_ns();
                 WFG_LOGD(dbg, "P#%llu present-real DONE r=%d", presents, (int)prr);
+                WFG_LOGD(dbg, "P#%llu pace: dt=%.2fms gen@+%.2fms real@+%.2fms spacing=%.2fms cap=%.2fms%s",
+                         presents, dtNs / 1e6,
+                         (double)((long long)tGenDone  - (long long)st->paceLastReal) / 1e6,
+                         (double)((long long)tRealDone - (long long)st->paceLastReal) / 1e6,
+                         (double)((long long)tRealDone - (long long)tGenDone) / 1e6,
+                         capNs / 1e6, lateSkip ? " pacing-skip(late)" : "");
+                st->paceLastReal = tRealDone;   // re-anchor the schedule to the actual beat
+                if (pace) {
+                    ++st->paceInserts;
+                    if ((st->paceInserts % 300ull) == 0)
+                        WFG_LOGI("pacing: dt=%.2fms lastSpacing=%.2fms lateSkips=%llu (paced=%llu)",
+                                 dtNs / 1e6, (double)((long long)tRealDone - (long long)tGenDone) / 1e6,
+                                 (unsigned long long)st->paceLate, (unsigned long long)st->paceInserts);
+                }
                 // Unambiguous last win-fg line before the guest thread runs its NEXT
                 // call — which the guest-acquire/guest-submit hooks then catch. If a
                 // guest-acquire/submit BEGIN with no END follows THIS line, that guest

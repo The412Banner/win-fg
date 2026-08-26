@@ -21,6 +21,20 @@ struct Config {
     // predicted-not-taken bool test per step, no logcat writes.
     // WIN_FG_DEBUG=1|0 / conf.toml debug=on|off.
     bool     debug       = false;
+    // ── EVEN-CADENCE FRAME PACING ─────────────────────────────────────────────
+    // Default ON. The 2x insert path presents the GENERATED frame then the REAL
+    // frame back-to-back in one vkQueuePresentKHR hook call, so on Mailbox/
+    // Immediate both land in ~one instant followed by a full frame-interval gap
+    // until the next pair — uneven in time → judder ("slows down to catch up").
+    // With pacing on, the layer measures the real-frame interval (EMA of a
+    // monotonic clock) and holds the REAL present to its scheduled beat so the
+    // generated frame lands near the temporal MIDPOINT between consecutive real
+    // frames (even gen,real,gen,real cadence). Pure bounded CPU sleep — no GPU
+    // wait added; if a frame is already behind schedule the wait is SKIPPED
+    // (present immediately) so worst case is one un-paced pair, never a hitch.
+    // FIFO self-paces so the waits collapse to ~0 there. Off ⇒ byte-identical
+    // back-to-back behaviour. WIN_FG_PACING=on|off / conf.toml pacing=on|off.
+    bool     pacing      = true;
     int      model       = 4;      // 3 = symmetric flow, 4 = bidir + occlusion gate
     int      multiplier  = 2;      // generated presents per real present + 1
     // EXTRA SWAPCHAIN IMAGE HEADROOM (device-freeze fix). On top of the +1 spare the
@@ -196,6 +210,7 @@ static inline void apply_toml(Config& c, const std::string& path) {
         if (k.empty() || v.empty()) continue;
         if      (k == "enabled")    c.enabled = (v == "1" || v == "true");
         else if (k == "debug")      c.debug = parse_bool(v, c.debug);
+        else if (k == "pacing")     c.pacing = parse_bool(v, c.pacing);
         else if (k == "model")      c.model = std::atoi(v.c_str());
         else if (k == "multiplier") c.multiplier = std::atoi(v.c_str());
         else if (k == "extra_images") c.extraImages = std::atoi(v.c_str());
@@ -258,6 +273,7 @@ static inline Config load_config() {
     Config c;
     c.enabled    = envi("WIN_FG_ENABLE", 0) != 0;
     if (const char* d = std::getenv("WIN_FG_DEBUG")) c.debug = parse_bool(d, c.debug);
+    if (const char* pc = std::getenv("WIN_FG_PACING")) c.pacing = parse_bool(pc, c.pacing);
     c.model      = envi("WIN_FG_MODEL", c.model);
     c.multiplier = envi("WIN_FG_MULT", c.multiplier);
     c.extraImages = envi("WIN_FG_EXTRA_IMAGES", c.extraImages);
