@@ -982,7 +982,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 s.prevValid = true;
                 if (presents < 5) WFG_LOGI("prev captured (first FG frame)");
                 WFG_LOGD(dbg, "P#%llu first-FG-frame present-real BEGIN (image=%u)", presents, idx);
-                VkResult pfr = presentOne(fc.currSem, idx, pPresentInfo->pNext);   // real: forward guest present-id
+                VkResult pfr = presentOne(fc.currSem, idx, nullptr);   // PRESENT-ID REVERT (750 A/B): pre-fix behaviour
                 WFG_LOGD(dbg, "P#%llu first-FG-frame present-real DONE r=%d", presents, (int)pfr);
                 return pfr;
             }
@@ -1127,7 +1127,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                     }
                 }
                 WFG_LOGD(dbg, "P#%llu present-real BEGIN (image=%u)", presents, idx);
-                VkResult prr = presentOne(fc.currSem, idx, pPresentInfo->pNext);   // real: forward guest present-id (retires vkWaitForPresentKHR)
+                VkResult prr = presentOne(fc.currSem, idx, nullptr);   // PRESENT-ID REVERT (750 A/B): pre-fix behaviour
                 uint64_t tRealDone = mono_ns();
                 WFG_LOGD(dbg, "P#%llu present-real DONE r=%d", presents, (int)prr);
                 WFG_LOGD(dbg, "P#%llu pace: dt=%.2fms gen@+%.2fms real@+%.2fms spacing=%.2fms cap=%.2fms%s",
@@ -1180,7 +1180,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                     return ptr;
                 }
                 WFG_LOGD(dbg, "P#%llu fallback present-real BEGIN (image=%u)", presents, idx);
-                VkResult prf = presentOne(fc.currSem, idx, pPresentInfo->pNext);   // real: forward guest present-id
+                VkResult prf = presentOne(fc.currSem, idx, nullptr);   // PRESENT-ID REVERT (750 A/B): pre-fix behaviour
                 WFG_LOGD(dbg, "P#%llu fallback present-real DONE r=%d", presents, (int)prf);
                 return prf;
             }
