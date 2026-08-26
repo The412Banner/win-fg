@@ -23,6 +23,20 @@ struct Config {
     bool     debug       = false;
     int      model       = 4;      // 3 = symmetric flow, 4 = bidir + occlusion gate
     int      multiplier  = 2;      // generated presents per real present + 1
+    // EXTRA SWAPCHAIN IMAGE HEADROOM (device-freeze fix). On top of the +1 spare the
+    // insert path needs, request this many ADDITIONAL images at swapchain creation:
+    //   requested minImageCount = app_min + 1 (spare) + extra_images,
+    // clamped to surfaceCaps.maxImageCount (0 = unlimited -> no clamp), never below
+    // app_min+1. The extra headroom stops the guest's NEXT vkAcquireNextImageKHR from
+    // starving while win-fg holds a spare + a real frame in flight to the AHB-backed
+    // host compositor. Some SoCs (Adreno 840 / Turnip) recycle displayed AHBs too
+    // slowly to tolerate the extra present with only the +1 spare and freeze on the
+    // first inserted frame; the AYANEO (Adreno 750) recycles fast enough to tolerate
+    // it. Default 2 (a few MB VRAM), applied on all devices. On a device that already
+    // works this only grows the pool — no FPS/quality change; the pool-headroom guard
+    // in QueuePresentKHR stays a no-op when headroom is adequate.
+    // WIN_FG_EXTRA_IMAGES / conf.toml extra_images.
+    int      extraImages = 2;
     float    flowScale   = 1.0f;   // scales solved flow magnitude
     // C1 GLOBAL-MOTION PRE-WARP. Estimate the per-frame camera affine (LK) and
     // remove it before the dense SAD flow search so the search only sees coherent
@@ -105,6 +119,7 @@ struct Config {
     void sanitize() {
         if (model < 3) model = 3; if (model > 4) model = 4;
         if (multiplier < 2) multiplier = 2; if (multiplier > 4) multiplier = 4;
+        if (extraImages < 0) extraImages = 0; if (extraImages > 8) extraImages = 8;
         if (gmMode < 0) gmMode = 0; if (gmMode > 2) gmMode = 2;
         if (frMode < 0) frMode = 0; if (frMode > 2) frMode = 2;
         if (frIters < 0) frIters = 0; if (frIters > 16) frIters = 16;
@@ -170,6 +185,7 @@ static inline void apply_toml(Config& c, const std::string& path) {
         else if (k == "debug")      c.debug = parse_bool(v, c.debug);
         else if (k == "model")      c.model = std::atoi(v.c_str());
         else if (k == "multiplier") c.multiplier = std::atoi(v.c_str());
+        else if (k == "extra_images") c.extraImages = std::atoi(v.c_str());
         else if (k == "global_motion") c.gmMode = parse_tristate(v, c.gmMode);
         else if (k == "flow_reg")   c.frMode = parse_tristate(v, c.frMode);
         else if (k == "fr_iters")   c.frIters = std::atoi(v.c_str());
@@ -230,6 +246,7 @@ static inline Config load_config() {
     if (const char* d = std::getenv("WIN_FG_DEBUG")) c.debug = parse_bool(d, c.debug);
     c.model      = envi("WIN_FG_MODEL", c.model);
     c.multiplier = envi("WIN_FG_MULT", c.multiplier);
+    c.extraImages = envi("WIN_FG_EXTRA_IMAGES", c.extraImages);
     if (const char* g = std::getenv("WIN_FG_GM")) c.gmMode = parse_tristate(g, c.gmMode);
     if (const char* r = std::getenv("WIN_FG_FLOWREG")) c.frMode = parse_tristate(r, c.frMode);
     c.frIters    = envi("WIN_FG_FR_ITERS", c.frIters);

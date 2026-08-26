@@ -24,6 +24,9 @@ struct InstanceDispatch {
     // may be null on a 1.0 instance — always null-check before calling.
     PFN_vkGetPhysicalDeviceProperties  GetPhysicalDeviceProperties = nullptr;
     PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2 = nullptr;
+    // Surface caps — used to clamp the extra-image-headroom request to the surface's
+    // maxImageCount so the bump never exceeds what the driver can grant.
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
 };
 
 // Device-level functions we call. Populated by walking vkGetDeviceProcAddr on

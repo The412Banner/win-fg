@@ -63,6 +63,9 @@ struct FrameCtx {
     VkSemaphore genSem   = VK_NULL_HANDLE;   // generated frame ready to present
     VkSemaphore currSem  = VK_NULL_HANDLE;   // real frame ready to present
     bool submitted = false;
+    bool heldSpare = false;  // this slot presented a GENERATED spare image (still in
+                             // flight to the host compositor); drives the pool-headroom
+                             // guard's estimate of how many images win-fg holds.
 };
 
 struct SwapState {
@@ -70,6 +73,9 @@ struct SwapState {
     VkFormat format{}; VkExtent2D extent{};
     std::vector<VkImage> images;
     std::vector<VkImageView> views;
+    uint32_t appMinImages = 0;   // the app's ORIGINAL minImageCount (its own working
+                                 // set); the pool-headroom guard reserves this many
+                                 // images for the guest before letting FG take a spare.
 
     // ── Phase 3 frame-insertion resources ────────────────────────────────────
     VkImage       prevImg  = VK_NULL_HANDLE;  // owned copy of the last real frame
@@ -492,6 +498,7 @@ extern "C" VkResult VKAPI_CALL winfg_CreateInstance(
     d.GetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)gipa(*pInstance, "vkGetPhysicalDeviceProperties2");
     if (!d.GetPhysicalDeviceProperties2)  // 1.0 instance: fall back to the KHR alias if the ext is present
         d.GetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)gipa(*pInstance, "vkGetPhysicalDeviceProperties2KHR");
+    d.GetPhysicalDeviceSurfaceCapabilitiesKHR = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)gipa(*pInstance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
     std::lock_guard<std::mutex> lk(g_lock);
     g_inst[dispatch_key(*pInstance)] = d;
     g_instHandle[dispatch_key(*pInstance)] = *pInstance;
@@ -629,7 +636,22 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
     // exceeded, memory), retry with the game's original count so we don't take
     // the app down.
     const uint32_t origMin = pCreateInfo->minImageCount;
-    ci.minImageCount = origMin + 1u;
+    // Query the surface's max image count so the extra-headroom request never asks
+    // for more than the driver can grant (0 = unlimited -> no clamp).
+    uint32_t maxImg = 0;
+    if (st.id && st.id->GetPhysicalDeviceSurfaceCapabilitiesKHR) {
+        VkSurfaceCapabilitiesKHR scaps{};
+        if (st.id->GetPhysicalDeviceSurfaceCapabilitiesKHR(st.phys, pCreateInfo->surface, &scaps) == VK_SUCCESS)
+            maxImg = scaps.maxImageCount;
+    }
+    // requested = app_min + 1 (spare) + extra_images headroom, clamped to the surface
+    // max (0 = unlimited), never below the +1 spare. The extra images stop the guest's
+    // next AcquireNextImageKHR from starving while win-fg holds a spare + a real frame
+    // in flight to the AHB-backed host compositor (the Fold8/Adreno840/Turnip freeze).
+    uint32_t desired = origMin + 1u + (uint32_t)st.cfg.extraImages;
+    if (maxImg != 0u && desired > maxImg) desired = maxImg;
+    if (desired < origMin + 1u) desired = origMin + 1u;   // always keep at least the spare
+    ci.minImageCount = desired;
     VkResult r = st.dd.CreateSwapchainKHR(device, &ci, pAlloc, pSwapchain);
     if (r != VK_SUCCESS) {
         WFG_LOGI("CreateSwapchain(minImageCount=%u) rejected (r=%d), retrying with app's minImageCount=%u",
@@ -639,6 +661,7 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
     }
     if (r != VK_SUCCESS) return r;
     SwapState s; s.swapchain = *pSwapchain; s.format = pCreateInfo->imageFormat; s.extent = pCreateInfo->imageExtent;
+    s.appMinImages = origMin;   // reserve this many for the guest in the headroom guard
     uint32_t n = 0; st.dd.GetSwapchainImagesKHR(device, *pSwapchain, &n, nullptr);
     s.images.resize(n); st.dd.GetSwapchainImagesKHR(device, *pSwapchain, &n, s.images.data());
     s.views.resize(n);
@@ -657,11 +680,12 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
     // are in on the affected device. ────────────────────────────────────────────
     WFG_LOGI("SWAPCHAIN-CTX %ux%u fmt=%d colorSpace=%d presentMode=%d(%s) "
              "minImageCount(app=%u requested=%u) actualImages=%u usage(app=0x%x forced=0x%x) "
-             "spare+1=%s enabled=%d debug=%d",
+             "spare+1=%s extra_req=%d granted_total=%u maxImageCount=%u enabled=%d debug=%d",
              s.extent.width, s.extent.height, (int)s.format, (int)pCreateInfo->imageColorSpace,
              (int)pCreateInfo->presentMode, presentModeName(pCreateInfo->presentMode),
              origMin, ci.minImageCount, n, pCreateInfo->imageUsage, ci.imageUsage,
-             (ci.minImageCount > origMin) ? "granted" : "FELL-BACK", st.cfg.enabled, st.cfg.debug);
+             (ci.minImageCount > origMin) ? "granted" : "FELL-BACK",
+             st.cfg.extraImages, n, maxImg, st.cfg.enabled, st.cfg.debug);
     // Always initialise the compute engine when the layer is loaded (not gated on
     // enabled), so the pipelines/pyramids build up-front and a live in-game enable
     // has nothing left to set up. Proves the compute path on Turnip even while idle.
@@ -819,7 +843,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             dd.BeginCommandBuffer(fc.cmd, &bi);
 
-            auto submitOne = [&](VkSemaphore sig) {
+            auto submitOne = [&](VkSemaphore sig) -> VkResult {
                 std::vector<VkPipelineStageFlags> ws(pi->waitSemaphoreCount, ALL);
                 VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
                 su.waitSemaphoreCount = pi->waitSemaphoreCount;
@@ -827,9 +851,12 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 su.pWaitDstStageMask = ws.empty() ? nullptr : ws.data();
                 su.commandBufferCount = 1; su.pCommandBuffers = &fc.cmd;
                 su.signalSemaphoreCount = 1; su.pSignalSemaphores = &sig;
-                VkResult sr = dd.QueueSubmit(st->queue, 1, &su, fc.fence); fc.submitted = true;
+                VkResult sr = dd.QueueSubmit(st->queue, 1, &su, fc.fence);
+                fc.submitted = (sr == VK_SUCCESS);   // only arm a fence wait we truly queued
+                fc.heldSpare = false;                // this path presents no generated spare
                 WFG_LOGD(dbg, "P#%llu compute-submit(single) DONE r=%d", presents, (int)sr);
                 if (sr != VK_SUCCESS) WFG_LOGE("P#%llu QueueSubmit(single) FAILED r=%d", presents, (int)sr);
+                return sr;
             };
             auto presentOne = [&](VkSemaphore wait, uint32_t image) {
                 VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -848,7 +875,14 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 imgBarrier(dd, fc.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL);
                 dd.EndCommandBuffer(fc.cmd);
                 WFG_LOGD(dbg, "P#%llu first-FG-frame compute-submit BEGIN", presents);
-                submitOne(fc.currSem);
+                if (submitOne(fc.currSem) != VK_SUCCESS) {
+                    // Submit failed -> currSem will never signal; do NOT present against
+                    // it (would block the compositor). Passthrough the real frame using
+                    // the app's own wait sems and leave prev invalid so we retry next frame.
+                    WFG_LOGD(dbg, "P#%llu first-FG-frame submit FAILED -> passthrough real", presents);
+                    VkResult ptr = st->dd.QueuePresentKHR(queue, pi);
+                    return ptr;
+                }
                 s.prevValid = true;
                 if (presents < 5) WFG_LOGI("prev captured (first FG frame)");
                 WFG_LOGD(dbg, "P#%llu first-FG-frame present-real BEGIN (image=%u)", presents, idx);
@@ -859,10 +893,34 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
 
             // ── generate the in-between frame; try to insert it as an EXTRA present (2x) ──
             uint32_t spareIdx = 0;
-            WFG_LOGD(dbg, "P#%llu acquire-spare BEGIN (timeout=2ms)", presents);
-            VkResult ar = dd.AcquireNextImageKHR(dev, sc, 2000000ull, fc.acquireSem, VK_NULL_HANDLE, &spareIdx);
-            bool insert = (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) && spareIdx < s.images.size();
-            WFG_LOGD(dbg, "P#%llu acquire-spare RESULT ar=%d spareIdx=%u insert=%d", presents, (int)ar, spareIdx, insert ? 1 : 0);
+            VkResult ar = VK_NOT_READY;
+            bool insert = false;
+
+            // ── POOL-HEADROOM GUARD ──────────────────────────────────────────────
+            // The extra present consumes an AHB-backed swapchain image the host
+            // compositor holds until it is displayed+released. If win-fg takes a spare
+            // when the pool is already near empty, the guest's NEXT vkAcquireNextImageKHR
+            // blocks waiting on the compositor -> render-thread freeze (Fold8/Adreno840
+            // /Turnip; the AYANEO/Adreno750 recycles fast enough to never hit this).
+            // Estimate free images = total - app's reserved working set - the spares
+            // win-fg still has in flight for its own generated presents. If taking a
+            // spare would leave < 1 image for the guest, SKIP the insert and pass the
+            // real frame through. With the extra_images headroom this is a no-op on a
+            // healthy device (free_est stays >= 1); it only bites a starved pool.
+            int held = 0;
+            for (uint32_t r = 0; r < s.ring.size(); ++r)
+                if (r != fcIdx && s.ring[r].submitted && s.ring[r].heldSpare) ++held;
+            int free_est = (int)s.images.size() - (int)s.appMinImages - held;
+            if (free_est < 1) {
+                WFG_LOGD(dbg, "P#%llu insert-skip-headroom held=%d free_est=%d (images=%zu appMin=%u) -> passthrough real",
+                         presents, held, free_est, s.images.size(), s.appMinImages);
+            } else {
+                WFG_LOGD(dbg, "P#%llu acquire-spare BEGIN (timeout=2ms) [headroom held=%d free_est=%d]",
+                         presents, held, free_est);
+                ar = dd.AcquireNextImageKHR(dev, sc, 2000000ull, fc.acquireSem, VK_NULL_HANDLE, &spareIdx);
+                insert = (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) && spareIdx < s.images.size();
+                WFG_LOGD(dbg, "P#%llu acquire-spare RESULT ar=%d spareIdx=%u insert=%d", presents, (int)ar, spareIdx, insert ? 1 : 0);
+            }
             // Diagnostic: 2x insert vs 3a blit-over fallback. If fallback climbs during
             // motion, the spare-image acquire is starving -> every frame becomes the soft
             // interpolated one -> blur (which a bg/fg swapchain recreate would reset).
@@ -908,9 +966,20 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 su.signalSemaphoreCount = 2; su.pSignalSemaphores = sigs;
                 WFG_LOGD(dbg, "P#%llu compute-submit BEGIN (insert: %u waits +acquire, 2 sig sems)",
                          presents, pi->waitSemaphoreCount);
-                VkResult isr = dd.QueueSubmit(st->queue, 1, &su, fc.fence); fc.submitted = true;
+                VkResult isr = dd.QueueSubmit(st->queue, 1, &su, fc.fence);
+                fc.submitted = (isr == VK_SUCCESS);   // only arm a fence wait we truly queued
+                fc.heldSpare = (isr == VK_SUCCESS);   // spare is in flight only if the submit took
                 WFG_LOGD(dbg, "P#%llu compute-submit DONE r=%d (insert)", presents, (int)isr);
-                if (isr != VK_SUCCESS) WFG_LOGE("P#%llu insert QueueSubmit FAILED r=%d", presents, (int)isr);
+                if (isr != VK_SUCCESS) {
+                    // genSem/currSem will never signal -> presenting against them would
+                    // block the compositor. Passthrough the real frame with the app's
+                    // own wait sems (no 2x this frame). The just-acquired spare is dropped
+                    // for this frame; on a submit failure (device-lost/OOM) that is the
+                    // safe outcome — never a lockup.
+                    WFG_LOGE("P#%llu insert QueueSubmit FAILED r=%d -> passthrough real", presents, (int)isr);
+                    VkResult ptr = st->dd.QueuePresentKHR(queue, pi);
+                    return ptr;
+                }
                 if (presents < 6) WFG_LOGI("2x insert live: spare=%u real=%u", spareIdx, idx);
                 WFG_LOGD(dbg, "P#%llu present-generated BEGIN (spare=%u)", presents, spareIdx);
                 VkResult pg = presentOne(fc.genSem, spareIdx);   // generated (in-between) frame first
@@ -941,7 +1010,12 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 imgBarrier(dd, fc.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL);
                 dd.EndCommandBuffer(fc.cmd);
                 WFG_LOGD(dbg, "P#%llu fallback compute-submit BEGIN", presents);
-                submitOne(fc.currSem);
+                if (submitOne(fc.currSem) != VK_SUCCESS) {
+                    // currSem will never signal -> passthrough with the app's own sems.
+                    WFG_LOGD(dbg, "P#%llu fallback submit FAILED -> passthrough real", presents);
+                    VkResult ptr = st->dd.QueuePresentKHR(queue, pi);
+                    return ptr;
+                }
                 WFG_LOGD(dbg, "P#%llu fallback present-real BEGIN (image=%u)", presents, idx);
                 VkResult prf = presentOne(fc.currSem, idx);
                 WFG_LOGD(dbg, "P#%llu fallback present-real DONE r=%d", presents, (int)prf);
