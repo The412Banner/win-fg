@@ -36,6 +36,11 @@ struct DeviceDispatch {
     PFN_vkDestroyDevice                DestroyDevice = nullptr;
     PFN_vkGetDeviceQueue               GetDeviceQueue = nullptr;
     PFN_vkQueueSubmit                  QueueSubmit = nullptr;
+    // Synchronization2 submit path (core 1.3 + KHR alias). DXVK may use either the
+    // legacy QueueSubmit or QueueSubmit2/2KHR; both are hooked for the guest-submit
+    // diagnostic. May be null if the device did not enable them — always null-check.
+    PFN_vkQueueSubmit2                 QueueSubmit2 = nullptr;
+    PFN_vkQueueSubmit2KHR              QueueSubmit2KHR = nullptr;
     PFN_vkQueueWaitIdle                QueueWaitIdle = nullptr;
     PFN_vkDeviceWaitIdle               DeviceWaitIdle = nullptr;
 
@@ -44,6 +49,10 @@ struct DeviceDispatch {
     PFN_vkDestroySwapchainKHR          DestroySwapchainKHR = nullptr;
     PFN_vkGetSwapchainImagesKHR        GetSwapchainImagesKHR = nullptr;
     PFN_vkAcquireNextImageKHR          AcquireNextImageKHR = nullptr;
+    // Alternate acquire entry (VK_KHR_swapchain 1.1+ / device-group). DXVK may use
+    // either AcquireNextImageKHR or AcquireNextImage2KHR — both hooked for the
+    // guest-acquire diagnostic. May be null — always null-check.
+    PFN_vkAcquireNextImage2KHR         AcquireNextImage2KHR = nullptr;
     PFN_vkQueuePresentKHR              QueuePresentKHR = nullptr;
 
     // resources

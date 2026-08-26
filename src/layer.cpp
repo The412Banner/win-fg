@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <sys/stat.h>
 
@@ -540,7 +541,9 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     dd.GetDeviceProcAddr = gdpa;
 #define L(n) load(dd.n, gdpa, *pDevice, "vk" #n)
     L(DestroyDevice); L(GetDeviceQueue); L(QueueSubmit); L(QueueWaitIdle); L(DeviceWaitIdle);
+    L(QueueSubmit2); L(QueueSubmit2KHR);   // guest-submit diag (may be null on this device)
     L(CreateSwapchainKHR); L(DestroySwapchainKHR); L(GetSwapchainImagesKHR); L(AcquireNextImageKHR); L(QueuePresentKHR);
+    L(AcquireNextImage2KHR);               // guest-acquire diag (may be null on this device)
     L(CreateImage); L(DestroyImage); L(CreateImageView); L(DestroyImageView);
     L(AllocateMemory); L(FreeMemory); L(BindImageMemory); L(GetImageMemoryRequirements);
     L(CreateBuffer); L(DestroyBuffer); L(GetBufferMemoryRequirements); L(BindBufferMemory); L(MapMemory); L(UnmapMemory);
@@ -637,12 +640,17 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
     // the app down.
     const uint32_t origMin = pCreateInfo->minImageCount;
     // Query the surface's max image count so the extra-headroom request never asks
-    // for more than the driver can grant (0 = unlimited -> no clamp).
+    // for more than the driver can grant (0 = unlimited -> no clamp). Keep the full
+    // caps struct around so SWAPCHAIN-CTX can log the TRUE simultaneous-acquire limit
+    // (needs surfaceCaps.minImageCount, which the app-requested min does NOT reveal).
     uint32_t maxImg = 0;
+    VkSurfaceCapabilitiesKHR scaps{};
+    bool haveCaps = false;
     if (st.id && st.id->GetPhysicalDeviceSurfaceCapabilitiesKHR) {
-        VkSurfaceCapabilitiesKHR scaps{};
-        if (st.id->GetPhysicalDeviceSurfaceCapabilitiesKHR(st.phys, pCreateInfo->surface, &scaps) == VK_SUCCESS)
+        if (st.id->GetPhysicalDeviceSurfaceCapabilitiesKHR(st.phys, pCreateInfo->surface, &scaps) == VK_SUCCESS) {
             maxImg = scaps.maxImageCount;
+            haveCaps = true;
+        }
     }
     // requested = app_min + 1 (spare) + extra_images headroom, clamped to the surface
     // max (0 = unlimited), never below the +1 spare. The extra images stop the guest's
@@ -686,6 +694,24 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
              origMin, ci.minImageCount, n, pCreateInfo->imageUsage, ci.imageUsage,
              (ci.minImageCount > origMin) ? "granted" : "FELL-BACK",
              st.cfg.extraImages, n, maxImg, st.cfg.enabled, st.cfg.debug);
+    // REAL surface limits (from vkGetPhysicalDeviceSurfaceCapabilitiesKHR, not the
+    // app's requested min). The true number of images win-fg can hold acquired at
+    // once = actualImages - surfaceCaps.minImageCount + 1; the guest's next acquire
+    // blocks once win-fg's held spare(s) push it past that — the Fold8/Adreno840
+    // freeze. This line gives surfaceCaps.minImageCount so that limit is computable.
+    if (haveCaps) {
+        int simAcquire = (int)n - (int)scaps.minImageCount + 1;
+        WFG_LOGI("SWAPCHAIN-CTX surfaceCaps.minImageCount=%u maxImageCount=%u "
+                 "currentExtent=%ux%u supportedUsage=0x%x | actualImages=%u "
+                 "sim-acquire-limit(images-surfMin+1)=%d",
+                 scaps.minImageCount, scaps.maxImageCount,
+                 scaps.currentExtent.width, scaps.currentExtent.height,
+                 scaps.supportedUsageFlags, n, simAcquire);
+    } else {
+        WFG_LOGI("SWAPCHAIN-CTX surfaceCaps UNAVAILABLE "
+                 "(GetPhysicalDeviceSurfaceCapabilitiesKHR missing/failed) — "
+                 "cannot compute true simultaneous-acquire limit");
+    }
     // Always initialise the compute engine when the layer is loaded (not gated on
     // enabled), so the pipelines/pyramids build up-front and a live in-game enable
     // has nothing left to set up. Proves the compute path on Turnip even while idle.
@@ -987,6 +1013,12 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 WFG_LOGD(dbg, "P#%llu present-real BEGIN (image=%u)", presents, idx);
                 VkResult prr = presentOne(fc.currSem, idx);      // then the real frame
                 WFG_LOGD(dbg, "P#%llu present-real DONE r=%d", presents, (int)prr);
+                // Unambiguous last win-fg line before the guest thread runs its NEXT
+                // call — which the guest-acquire/guest-submit hooks then catch. If a
+                // guest-acquire/submit BEGIN with no END follows THIS line, that guest
+                // call is the one that hangs after a clean insert (the Fold8 freeze).
+                WFG_LOGD(dbg, "P#%llu insert-complete -> returning r=%d (VK_SUCCESS=0) to guest",
+                         presents, (int)prr);
                 return prr;
             } else {
                 // No spare image available -> we cannot true-2x this frame.
@@ -1034,22 +1066,189 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
     return ptr;
 }
 
+// ── GUEST-CALL DIAGNOSTIC HOOKS (gated behind WIN_FG_DEBUG) ───────────────────
+// win-fg's own present hook goes SILENT the instant the GUEST render thread blocks
+// on its NEXT Vulkan call after an inserted frame (device-proven Fold8/Adreno840/
+// Turnip: the first insert completes clean — all r=0 through insert-complete — then
+// the guest never calls present again and force-closes ~30s later). To see WHICH
+// guest call hangs we shadow the guest's OWN vkAcquireNextImage{,2}KHR and
+// vkQueueSubmit{,2,2KHR}: a BEGIN with no matching END pinpoints the stuck stage.
+//
+// win-fg's internal spare-acquire and compute-submits go through the dd.* down-call
+// pointers, NOT these wrappers, so they are NOT double-logged — these lines are the
+// GUEST's calls only. Verbose BEGIN/END is emitted ONLY when cfg.debug (WIN_FG_DEBUG)
+// AND cfg.enabled (FG on) — the freeze window — so the pre-enable stream stays quiet.
+//
+// CRITICAL: g_lock is taken ONLY to snapshot the down-call pointer + gate flags, then
+// RELEASED before the (possibly never-returning) down-call. Holding g_lock across a
+// hung guest call would deadlock the present thread and mask the very freeze we are
+// trying to observe. The BEGIN line is written (android_log is synchronous → on the
+// logcat socket) BEFORE the down-call, so it survives even if the call never returns.
+namespace {
+struct GuestHookCtx {
+    bool found = false;
+    bool log   = false;   // cfg.debug && cfg.enabled
+    PFN_vkAcquireNextImageKHR   AcquireNextImageKHR   = nullptr;
+    PFN_vkAcquireNextImage2KHR  AcquireNextImage2KHR  = nullptr;
+    PFN_vkQueueSubmit           QueueSubmit           = nullptr;
+    PFN_vkQueueSubmit2          QueueSubmit2          = nullptr;
+    PFN_vkQueueSubmit2KHR       QueueSubmit2KHR       = nullptr;
+};
+// key = dispatch_key(device) OR dispatch_key(queue) — a queue shares its device's
+// dispatch key, so both resolve the same DeviceState.
+static GuestHookCtx snapshotGuestCtx(void* key) {
+    GuestHookCtx c;
+    std::lock_guard<std::mutex> lk(g_lock);
+    auto it = g_dev.find(key);
+    if (it == g_dev.end()) return c;
+    const DeviceState& ds = it->second;
+    c.found = true;
+    c.log   = ds.cfg.debug && ds.cfg.enabled;
+    c.AcquireNextImageKHR  = ds.dd.AcquireNextImageKHR;
+    c.AcquireNextImage2KHR = ds.dd.AcquireNextImage2KHR;
+    c.QueueSubmit          = ds.dd.QueueSubmit;
+    c.QueueSubmit2         = ds.dd.QueueSubmit2;
+    c.QueueSubmit2KHR      = ds.dd.QueueSubmit2KHR;
+    return c;
+}
+} // namespace
+
+extern "C" VkResult VKAPI_CALL winfg_AcquireNextImageKHR(
+    VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+    VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex) {
+    GuestHookCtx c = snapshotGuestCtx(dispatch_key(device));
+    if (!c.AcquireNextImageKHR) return VK_ERROR_DEVICE_LOST;   // no down-call — cannot service
+    static std::atomic<unsigned long long> ctr{0};
+    unsigned long long n = ++ctr;
+    unsigned long long t0 = 0;
+    if (c.log) {
+        t0 = now_ns();
+        WFG_LOGI("guest-acquire BEGIN #%llu (timeout=%llu sem=0x%llx fence=0x%llx swapchain=0x%llx)",
+                 n, (unsigned long long)timeout,
+                 (unsigned long long)(uintptr_t)semaphore, (unsigned long long)(uintptr_t)fence,
+                 (unsigned long long)(uintptr_t)swapchain);
+    }
+    VkResult r = c.AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
+    if (c.log) {
+        unsigned long long e = (now_ns() - t0) / 1000ull;
+        uint32_t idx = (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) && pImageIndex ? *pImageIndex : 0xffffffffu;
+        WFG_LOGI("guest-acquire END   #%llu r=%d imageIndex=%u elapsed_us=%llu", n, (int)r, idx, e);
+    }
+    return r;
+}
+
+extern "C" VkResult VKAPI_CALL winfg_AcquireNextImage2KHR(
+    VkDevice device, const VkAcquireNextImageInfoKHR* pAcquireInfo, uint32_t* pImageIndex) {
+    GuestHookCtx c = snapshotGuestCtx(dispatch_key(device));
+    if (!c.AcquireNextImage2KHR) return VK_ERROR_DEVICE_LOST;
+    static std::atomic<unsigned long long> ctr{0};
+    unsigned long long n = ++ctr;
+    unsigned long long t0 = 0;
+    if (c.log) {
+        t0 = now_ns();
+        WFG_LOGI("guest-acquire BEGIN #%llu [2KHR] (timeout=%llu sem=0x%llx fence=0x%llx swapchain=0x%llx)",
+                 n, (unsigned long long)(pAcquireInfo ? pAcquireInfo->timeout : 0),
+                 (unsigned long long)(uintptr_t)(pAcquireInfo ? pAcquireInfo->semaphore : VK_NULL_HANDLE),
+                 (unsigned long long)(uintptr_t)(pAcquireInfo ? pAcquireInfo->fence : VK_NULL_HANDLE),
+                 (unsigned long long)(uintptr_t)(pAcquireInfo ? pAcquireInfo->swapchain : VK_NULL_HANDLE));
+    }
+    VkResult r = c.AcquireNextImage2KHR(device, pAcquireInfo, pImageIndex);
+    if (c.log) {
+        unsigned long long e = (now_ns() - t0) / 1000ull;
+        uint32_t idx = (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) && pImageIndex ? *pImageIndex : 0xffffffffu;
+        WFG_LOGI("guest-acquire END   #%llu [2KHR] r=%d imageIndex=%u elapsed_us=%llu", n, (int)r, idx, e);
+    }
+    return r;
+}
+
+extern "C" VkResult VKAPI_CALL winfg_QueueSubmit(
+    VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
+    GuestHookCtx c = snapshotGuestCtx(dispatch_key(queue));
+    if (!c.QueueSubmit) return VK_ERROR_DEVICE_LOST;
+    static std::atomic<unsigned long long> ctr{0};
+    unsigned long long n = ++ctr;
+    unsigned long long t0 = 0;
+    if (c.log) {
+        t0 = now_ns();
+        WFG_LOGI("guest-submit BEGIN #%llu (submitCount=%u fence=0x%llx queue=0x%llx)",
+                 n, submitCount, (unsigned long long)(uintptr_t)fence, (unsigned long long)(uintptr_t)queue);
+    }
+    VkResult r = c.QueueSubmit(queue, submitCount, pSubmits, fence);
+    if (c.log) {
+        unsigned long long e = (now_ns() - t0) / 1000ull;
+        WFG_LOGI("guest-submit END   #%llu r=%d elapsed_us=%llu", n, (int)r, e);
+    }
+    return r;
+}
+
+extern "C" VkResult VKAPI_CALL winfg_QueueSubmit2(
+    VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence) {
+    GuestHookCtx c = snapshotGuestCtx(dispatch_key(queue));
+    if (!c.QueueSubmit2) return VK_ERROR_DEVICE_LOST;
+    static std::atomic<unsigned long long> ctr{0};
+    unsigned long long n = ++ctr;
+    unsigned long long t0 = 0;
+    if (c.log) {
+        t0 = now_ns();
+        WFG_LOGI("guest-submit BEGIN #%llu [2] (submitCount=%u fence=0x%llx queue=0x%llx)",
+                 n, submitCount, (unsigned long long)(uintptr_t)fence, (unsigned long long)(uintptr_t)queue);
+    }
+    VkResult r = c.QueueSubmit2(queue, submitCount, pSubmits, fence);
+    if (c.log) {
+        unsigned long long e = (now_ns() - t0) / 1000ull;
+        WFG_LOGI("guest-submit END   #%llu [2] r=%d elapsed_us=%llu", n, (int)r, e);
+    }
+    return r;
+}
+
+extern "C" VkResult VKAPI_CALL winfg_QueueSubmit2KHR(
+    VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence) {
+    GuestHookCtx c = snapshotGuestCtx(dispatch_key(queue));
+    if (!c.QueueSubmit2KHR) return VK_ERROR_DEVICE_LOST;
+    static std::atomic<unsigned long long> ctr{0};
+    unsigned long long n = ++ctr;
+    unsigned long long t0 = 0;
+    if (c.log) {
+        t0 = now_ns();
+        WFG_LOGI("guest-submit BEGIN #%llu [2KHR] (submitCount=%u fence=0x%llx queue=0x%llx)",
+                 n, submitCount, (unsigned long long)(uintptr_t)fence, (unsigned long long)(uintptr_t)queue);
+    }
+    VkResult r = c.QueueSubmit2KHR(queue, submitCount, pSubmits, fence);
+    if (c.log) {
+        unsigned long long e = (now_ns() - t0) / 1000ull;
+        WFG_LOGI("guest-submit END   #%llu [2KHR] r=%d elapsed_us=%llu", n, (int)r, e);
+    }
+    return r;
+}
+
 // ── proc addr + negotiation ──────────────────────────────────────────────────
 #define INTERCEPT(name) if (!strcmp(pName, "vk" #name)) return (PFN_vkVoidFunction)&winfg_##name;
 
 extern "C" VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL winfg_GetDeviceProcAddr(VkDevice device, const char* pName) {
     INTERCEPT(CreateSwapchainKHR) INTERCEPT(DestroySwapchainKHR) INTERCEPT(QueuePresentKHR)
     INTERCEPT(DestroyDevice)
+    // Guest-call diagnostic hooks. AcquireNextImageKHR + QueueSubmit are always present
+    // when a swapchain is in use (same assumption as the present/swapchain intercepts).
+    INTERCEPT(AcquireNextImageKHR) INTERCEPT(QueueSubmit)
     std::lock_guard<std::mutex> lk(g_lock);
     auto it = g_dev.find(dispatch_key(device));
     if (it == g_dev.end() || !it->second.dd.GetDeviceProcAddr) return nullptr;
-    return it->second.dd.GetDeviceProcAddr(device, pName);
+    const DeviceDispatch& dd = it->second.dd;
+    // Conditional intercepts — only SHADOW a 2-variant the device actually provides,
+    // so we never advertise an entry point the driver/device does not support.
+    if (!strcmp(pName, "vkAcquireNextImage2KHR") && dd.AcquireNextImage2KHR) return (PFN_vkVoidFunction)&winfg_AcquireNextImage2KHR;
+    if (!strcmp(pName, "vkQueueSubmit2")    && dd.QueueSubmit2)    return (PFN_vkVoidFunction)&winfg_QueueSubmit2;
+    if (!strcmp(pName, "vkQueueSubmit2KHR") && dd.QueueSubmit2KHR) return (PFN_vkVoidFunction)&winfg_QueueSubmit2KHR;
+    return dd.GetDeviceProcAddr(device, pName);
 }
 
 extern "C" VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL winfg_GetInstanceProcAddr(VkInstance instance, const char* pName) {
     INTERCEPT(GetInstanceProcAddr) INTERCEPT(CreateInstance) INTERCEPT(DestroyInstance)
     INTERCEPT(CreateDevice) INTERCEPT(GetDeviceProcAddr)
     INTERCEPT(CreateSwapchainKHR) INTERCEPT(DestroySwapchainKHR) INTERCEPT(QueuePresentKHR)
+    // Guest-call diagnostic hooks (always-present entries; the 2-variants are resolved
+    // conditionally in winfg_GetDeviceProcAddr, which is how DXVK looks them up).
+    INTERCEPT(AcquireNextImageKHR) INTERCEPT(QueueSubmit)
     if (instance == VK_NULL_HANDLE) return nullptr;
     std::lock_guard<std::mutex> lk(g_lock);
     auto it = g_inst.find(dispatch_key(instance));
