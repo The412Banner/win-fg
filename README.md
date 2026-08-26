@@ -88,6 +88,53 @@ fully GPU-bound title it can't beat the GPU-throughput wall, and Adreno/Turnip
 typically exposes no spare compute queue, so it falls back to the (proven)
 synchronous path. See [`docs/research/ROADMAP.md`](docs/research/ROADMAP.md).
 
+## Training-data capture mode (Route-B dataset collection)
+
+A **dev-only** gate (`src/capture.hpp`) that dumps the *real, pre-interpolation*
+game frames the layer sees at present time — the raw swapchain color image copied
+to `prevImg`, **before** win-fg's synthesis and with **no HUD/overlay** (the HUD is
+host-composited downstream, so the layer's frame is clean). It **never** captures
+generated frames. Purpose: build clean `(i-1, i+1) → i` triplets for a future VFI
+neural model, offline.
+
+**Default OFF ⇒ zero overhead:** when off, the present path is a single bool test
+and is byte-identical to a build without the feature. When on, capture adds a GPU
+blit + readback + async encode — **this costs performance; it is a collection mode,
+not a shipping one.**
+
+Turnip-safe: RGBA8/UNORM readback only, no float images, no atomics, no extended
+formats; the readback is fixed-function blit + copy-to-buffer.
+
+| conf.toml | env | default | meaning |
+|---|---|---|---|
+| `capture` | `WIN_FG_CAPTURE` | `off` | master gate (`on`/`off`) |
+| `capture_dir` | `WIN_FG_CAPTURE_DIR` | `$HOME/.cache/winfg-capture` | output root (pullable via the root bridge) |
+| `capture_mode` | `WIN_FG_CAPTURE_MODE` | `patch` | `patch` = aligned triplet crops, `frame` = full downscaled frames |
+| `capture_width` | `WIN_FG_CAPTURE_W` | `1280` | downscale target box width (aspect-preserving, never upscales) |
+| `capture_height` | `WIN_FG_CAPTURE_H` | `720` | downscale target box height |
+| `capture_patches` | `WIN_FG_CAPTURE_PATCHES` | `3` | motion-rich 256² crops per triplet (patch mode) |
+| `capture_patch_size` | `WIN_FG_CAPTURE_PATCH` | `256` | crop edge in downscaled px |
+| `capture_motion` | `WIN_FG_CAPTURE_MOTION` | `2.0` | skip units whose inter-frame mean luma abs-diff (0–255) is below this |
+| `capture_shard_mb` | `WIN_FG_CAPTURE_SHARD_MB` | `1024` | rolling-container size cap (few large files, not thousands of small ones) |
+
+**Enable (device):** write to the same `conf.toml` the layer hot-reloads, e.g.
+
+```
+# $HOME/.config/win-fg/conf.toml   (inside the container's imagefs home)
+capture = on
+capture_mode = patch
+capture_motion = 2.0
+```
+
+or via env before launch: `WIN_FG_CAPTURE=1 WIN_FG_CAPTURE_MODE=patch`.
+
+**Output:** a per-run `session_<epoch_ms>/` under the root, containing a small
+number of large **`.wfgcap`** containers (lossless packed **QOI** blobs) plus a
+`manifest.jsonl` index. **Everything is lossless** — never a lossy video codec.
+Watch `logcat -s win-fg` for `capture ON …` and periodic `capture rate: …` lines.
+Exact container byte layout + how to reconstruct triplets offline are documented in
+`src/capture.hpp`.
+
 ## Roadmap
 
 - ✅ **Done (v0.2):** anti-ghost, C1 global-motion pre-warp, C2 TV-L1 flow-reg,

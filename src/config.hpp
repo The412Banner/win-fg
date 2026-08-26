@@ -64,6 +64,36 @@ struct Config {
     float    hudX1       = 0.0f;
     float    hudY1       = 0.0f;
 
+    // ── TRAINING-DATA CAPTURE MODE (Route-B VFI dataset collection) ───────────
+    // A dev-only gate. When OFF (default) the present path is byte-identical to a
+    // build without this feature — a single bool test and nothing else. When ON,
+    // every real present is downscaled on the GPU, read back async, and written to
+    // disk as lossless QOI (motion-rich 256² triplet patches by default, or full
+    // downscaled frames) plus a JSONL manifest, for offline (i-1,i+1)->i training.
+    // NEVER captures win-fg's generated frames — capture reads the real swapchain
+    // image at the TOP of QueuePresentKHR, before any interpolation.
+    // WIN_FG_CAPTURE=on|off  /  conf.toml capture=on|off.
+    bool     capture       = false;
+    // Downscale target box (aspect-preserving, never upscales). WIN_FG_CAPTURE_W/H,
+    // conf capture_width/capture_height.
+    int      captureW      = 1280;
+    int      captureH      = 720;
+    // 0 = patch (self-contained aligned triplets, DEFAULT), 1 = frame (full
+    // downscaled frames in order). WIN_FG_CAPTURE_MODE=patch|frame.
+    int      capMode       = 0;
+    int      capPatches    = 3;     // patches per triplet in patch mode (WIN_FG_CAPTURE_PATCHES)
+    int      capPatchSize  = 256;   // patch edge in downscaled px (WIN_FG_CAPTURE_PATCH)
+    // Skip a unit whose inter-frame motion (mean per-pixel luma abs-diff, 0..255)
+    // is below this. WIN_FG_CAPTURE_MOTION / conf capture_motion.
+    float    capMotion     = 2.0f;
+    // Output dir; empty => $HOME/.cache/winfg-capture. WIN_FG_CAPTURE_DIR /
+    // conf capture_dir. A per-run session subdir is created under it.
+    std::string capDir;
+    // Rolling-shard size cap (MiB). Output is a small number of large packed
+    // .wfgcap containers, not thousands of loose files; a new shard opens when the
+    // current one passes this. WIN_FG_CAPTURE_SHARD_MB / conf capture_shard_mb.
+    int      capShardMB    = 1024;
+
     void sanitize() {
         if (model < 3) model = 3; if (model > 4) model = 4;
         if (multiplier < 2) multiplier = 2; if (multiplier > 4) multiplier = 4;
@@ -76,6 +106,14 @@ struct Config {
         if (frEps < 1e-3f) frEps = 1e-3f;
         if (flowScale < 0.05f) flowScale = 0.05f; if (flowScale > 4.0f) flowScale = 4.0f;
         if (beta < 0.0f) beta = 0.0f; if (lambda < 0.0f) lambda = 0.0f;
+        // capture knobs
+        if (captureW < 16) captureW = 16; if (captureW > 7680) captureW = 7680;
+        if (captureH < 16) captureH = 16; if (captureH > 4320) captureH = 4320;
+        if (capMode < 0) capMode = 0; if (capMode > 1) capMode = 1;
+        if (capPatches < 1) capPatches = 1; if (capPatches > 16) capPatches = 16;
+        if (capPatchSize < 16) capPatchSize = 16; if (capPatchSize > 1024) capPatchSize = 1024;
+        if (capMotion < 0.0f) capMotion = 0.0f;
+        if (capShardMB < 16) capShardMB = 16; if (capShardMB > 65536) capShardMB = 65536;
     }
 };
 
@@ -92,6 +130,18 @@ static inline int parse_tristate(const std::string& v, int dflt) {
     if (v == "auto") return 0;
     if (v == "on"  || v == "1" || v == "force" || v == "true"  || v == "yes") return 1;
     if (v == "off" || v == "0" || v == "false" || v == "no")                  return 2;
+    return dflt;
+}
+
+// "on"/"off"/"1"/"true"/... -> bool.
+static inline bool parse_bool(const std::string& v, bool dflt) {
+    int t = parse_tristate(v, dflt ? 1 : 2);
+    return t == 1;
+}
+// "patch"|"frame" -> {0 patch, 1 frame}.
+static inline int parse_capmode(const std::string& v, int dflt) {
+    if (v == "patch" || v == "patches" || v == "0") return 0;
+    if (v == "frame" || v == "frames"  || v == "1") return 1;
     return dflt;
 }
 
@@ -123,6 +173,16 @@ static inline void apply_toml(Config& c, const std::string& path) {
         else if (k == "lambda")     c.lambda = std::strtof(v.c_str(), nullptr);
         else if (k == "epsilon")    c.epsilon = std::strtof(v.c_str(), nullptr);
         else if (k == "photoScale") c.photoScale = std::strtof(v.c_str(), nullptr);
+        // ── capture-mode knobs ────────────────────────────────────────────────
+        else if (k == "capture")        c.capture = parse_bool(v, c.capture);
+        else if (k == "capture_dir")    c.capDir = v;
+        else if (k == "capture_width")  c.captureW = std::atoi(v.c_str());
+        else if (k == "capture_height") c.captureH = std::atoi(v.c_str());
+        else if (k == "capture_mode")   c.capMode = parse_capmode(v, c.capMode);
+        else if (k == "capture_patches")    c.capPatches = std::atoi(v.c_str());
+        else if (k == "capture_patch_size") c.capPatchSize = std::atoi(v.c_str());
+        else if (k == "capture_motion")     c.capMotion = std::strtof(v.c_str(), nullptr);
+        else if (k == "capture_shard_mb")   c.capShardMB = std::atoi(v.c_str());
         else if (k == "hudRect") {
             // "x0,y0,x1,y1" in pixel coords
             float r[4] = {0,0,0,0}; int n = 0;
@@ -146,6 +206,14 @@ static inline std::string conf_path() {
     return home ? std::string(home) + "/.config/win-fg/conf.toml" : std::string();
 }
 
+// Resolve the capture output root: explicit override, else $HOME/.cache/winfg-capture,
+// else a /tmp fallback so a HOME-less prefix still writes somewhere pullable.
+static inline std::string capture_root(const Config& c) {
+    if (!c.capDir.empty()) return c.capDir;
+    if (const char* home = std::getenv("HOME")) return std::string(home) + "/.cache/winfg-capture";
+    return std::string("/tmp/winfg-capture");
+}
+
 // env defaults first, then conf.toml overrides (file wins when present).
 static inline Config load_config() {
     Config c;
@@ -164,6 +232,16 @@ static inline Config load_config() {
     c.lambda     = envf("WIN_FG_LAMBDA", c.lambda);
     c.epsilon    = envf("WIN_FG_EPSILON", c.epsilon);
     c.photoScale = envf("WIN_FG_PHOTOSCALE", c.photoScale);
+    // ── capture-mode env (conf.toml still wins below) ─────────────────────────
+    if (const char* cc = std::getenv("WIN_FG_CAPTURE")) c.capture = parse_bool(cc, c.capture);
+    c.captureW     = envi("WIN_FG_CAPTURE_W", c.captureW);
+    c.captureH     = envi("WIN_FG_CAPTURE_H", c.captureH);
+    if (const char* cm = std::getenv("WIN_FG_CAPTURE_MODE")) c.capMode = parse_capmode(cm, c.capMode);
+    c.capPatches   = envi("WIN_FG_CAPTURE_PATCHES", c.capPatches);
+    c.capPatchSize = envi("WIN_FG_CAPTURE_PATCH", c.capPatchSize);
+    c.capMotion    = envf("WIN_FG_CAPTURE_MOTION", c.capMotion);
+    c.capShardMB   = envi("WIN_FG_CAPTURE_SHARD_MB", c.capShardMB);
+    if (const char* cd = std::getenv("WIN_FG_CAPTURE_DIR")) c.capDir = cd;
     if (const char* h = std::getenv("WIN_FG_HUD_RECT")) {
         // "x0,y0,x1,y1" — pixel coords; disabled when x0>=x1 or y0>=y1
         float r[4] = {0,0,0,0}; int n = 0;

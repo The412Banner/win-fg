@@ -129,9 +129,17 @@ form:**
 
 ---
 
+## Data formats / encoders
+
+### QOI (Quite OK Image) — lossless
+- **License:** public domain / MIT (© Dominic Szablewski). Spec: [qoiformat.org](https://qoiformat.org).
+- **Used for:** the lossless RGBA8 encoding of the training-data capture-mode output (`src/capture.hpp`). Our encoder is a clean-room implementation of the published QOI spec (no third-party code); the blobs are packed inside our own `.wfgcap` container. QOI is used because it is lossless (no JPEG/video artifacts to poison training) and cheap to encode (keeps the capture overhead low). See the capture-mode docs in `README.md`.
+
+---
+
 ## Training data (Phase 2)
 
-- **Self-captured Bannerlator game footage** (Mode A: 120fps native capture; Mode B: pre-classical flow ground truth) — the sole source for the final fine-tune data. Owned by us. Not redistributed.
+- **Self-captured Bannerlator game footage** (Mode A: 120fps native capture; Mode B: pre-classical flow ground truth via the capture mode below) — the sole source for the final fine-tune data. Owned by us. Not redistributed.
 - **RIFE upstream pretraining checkpoint (Vimeo90K)** — used as warm-start only. Full data replacement in fine-tune erases the Vimeo90K taint.
 - **No scraped YouTube / Twitch / commercial-platform video** enters our training pipeline.
 

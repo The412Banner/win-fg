@@ -5,6 +5,7 @@
 #include "vk_dispatch.hpp"
 #include "framegen.hpp"
 #include "config.hpp"
+#include "capture.hpp"
 #include "log.hpp"
 #include <vulkan/vk_layer.h>
 #include <map>
@@ -13,6 +14,8 @@
 #include <string>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
+#include <chrono>
 #include <sys/stat.h>
 
 using namespace winfg;
@@ -177,6 +180,217 @@ static void destroyInsert(SwapState& s, DeviceState& ds) {
     s.insertReady = false; s.prevValid = false;
 }
 
+// ── TRAINING-DATA CAPTURE (GPU side) ─────────────────────────────────────────
+// Per-swapchain: a small ring of {downscaled image + host-visible readback buffer
+// + cmd + fence + doneSem}. Each present blits the real curr swapchain image into
+// the ring slot's downscaled image, copies it to the buffer, and signals doneSem
+// (which the real present then waits on, so the app's render-finished sems are
+// consumed exactly once). Readback is ASYNC: we ship the slot that's `kCapRing`
+// presents old (its fence has long since signaled), so no fresh stall. The heavy
+// motion/patch/QOI/manifest work runs on CaptureEngine's own thread — the present
+// thread only pays a blit+copy submit and one memcpy.
+struct CapSlot {
+    VkImage        down    = VK_NULL_HANDLE;
+    VkDeviceMemory downMem = VK_NULL_HANDLE;
+    VkImageView    downView= VK_NULL_HANDLE;   // unused; makeOwnedImage returns one
+    VkBuffer       buf     = VK_NULL_HANDLE;
+    VkDeviceMemory bufMem  = VK_NULL_HANDLE;
+    void*          bufPtr  = nullptr;
+    VkCommandBuffer cmd    = VK_NULL_HANDLE;
+    VkFence        fence   = VK_NULL_HANDLE;
+    VkSemaphore    doneSem = VK_NULL_HANDLE;
+    bool           submitted = false;
+    uint64_t       srcIndex  = 0;
+    uint64_t       tsNs      = 0;
+};
+struct CaptureState {
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    VkExtent2D  srcExtent{}; VkExtent2D dstExtent{}; VkFormat srcFormat{};
+    VkCommandPool pool = VK_NULL_HANDLE;
+    std::vector<CapSlot> ring; uint32_t ringIdx = 0;
+    size_t      bufBytes = 0;
+    bool        ready = false;
+    bool        failed = false;
+    unsigned long long captured = 0;   // presents captured (for periodic logging)
+    winfg::CaptureEngine engine;       // non-movable — only ever built in place in g_cap
+};
+std::map<VkSwapchainKHR, CaptureState> g_cap;
+
+static const int kCapRing = 3;
+
+static uint64_t now_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Aspect-preserving downscale target that never upscales; dims rounded to >=2 even.
+static VkExtent2D computeDstExtent(VkExtent2D src, int targetW, int targetH) {
+    double sw = src.width ? (double)targetW / src.width : 1.0;
+    double sh = src.height ? (double)targetH / src.height : 1.0;
+    double sc = sw < sh ? sw : sh; if (sc > 1.0) sc = 1.0;   // never upscale
+    uint32_t w = (uint32_t)(src.width  * sc + 0.5);
+    uint32_t h = (uint32_t)(src.height * sc + 0.5);
+    if (w < 2) w = 2; if (h < 2) h = 2;
+    w &= ~1u; h &= ~1u;
+    return { w, h };
+}
+
+static bool makeReadbackBuffer(const DeviceDispatch& dd, const VkPhysicalDeviceMemoryProperties& mp,
+                               VkDevice dev, VkDeviceSize size,
+                               VkBuffer& buf, VkDeviceMemory& mem, void*& ptr) {
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size; bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (dd.CreateBuffer(dev, &bi, nullptr, &buf) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr; dd.GetBufferMemoryRequirements(dev, buf, &mr);
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        if ((mr.memoryTypeBits & (1u<<i)) && (mp.memoryTypes[i].propertyFlags & want) == want) { idx = i; break; }
+    if (idx == UINT32_MAX) return false;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size; ai.memoryTypeIndex = idx;
+    if (dd.AllocateMemory(dev, &ai, nullptr, &mem) != VK_SUCCESS) return false;
+    if (dd.BindBufferMemory(dev, buf, mem, 0) != VK_SUCCESS) return false;
+    return dd.MapMemory(dev, mem, 0, size, 0, &ptr) == VK_SUCCESS;
+}
+
+static void destroyCapture(CaptureState& cap, DeviceState& ds) {
+    const DeviceDispatch& dd = ds.dd; VkDevice dev = ds.device;
+    if (dev && dd.DeviceWaitIdle) dd.DeviceWaitIdle(dev);
+    // Flush any submitted-but-unshipped slots to the encoder in source order.
+    if (cap.engine.running()) {
+        std::vector<CapSlot*> pend;
+        for (auto& slot : cap.ring) if (slot.submitted) pend.push_back(&slot);
+        std::sort(pend.begin(), pend.end(), [](CapSlot* a, CapSlot* b){ return a->srcIndex < b->srcIndex; });
+        for (auto* slot : pend) {
+            if (dd.WaitForFences) dd.WaitForFences(dev, 1, &slot->fence, VK_TRUE, UINT64_MAX);
+            cap.engine.submit((const uint8_t*)slot->bufPtr, cap.dstExtent.width, cap.dstExtent.height, slot->srcIndex, slot->tsNs);
+            slot->submitted = false;
+        }
+    }
+    cap.engine.stop();
+    for (auto& slot : cap.ring) {
+        if (slot.fence)    dd.DestroyFence(dev, slot.fence, nullptr);
+        if (slot.doneSem)  dd.DestroySemaphore(dev, slot.doneSem, nullptr);
+        if (slot.downView) dd.DestroyImageView(dev, slot.downView, nullptr);
+        if (slot.down)     dd.DestroyImage(dev, slot.down, nullptr);
+        if (slot.downMem)  dd.FreeMemory(dev, slot.downMem, nullptr);
+        if (slot.bufMem)   dd.UnmapMemory(dev, slot.bufMem);
+        if (slot.buf)      dd.DestroyBuffer(dev, slot.buf, nullptr);
+        if (slot.bufMem)   dd.FreeMemory(dev, slot.bufMem, nullptr);
+    }
+    cap.ring.clear();
+    if (cap.pool) dd.DestroyCommandPool(dev, cap.pool, nullptr);
+    cap.pool = VK_NULL_HANDLE; cap.ready = false;
+}
+
+static bool initCapture(CaptureState& cap, DeviceState& ds, SwapState& s, const Config& cfg) {
+    const DeviceDispatch& dd = ds.dd; VkDevice dev = ds.device;
+    cap.swapchain = s.swapchain; cap.srcExtent = s.extent; cap.srcFormat = s.format;
+    cap.dstExtent = computeDstExtent(s.extent, cfg.captureW, cfg.captureH);
+    cap.bufBytes = (size_t)cap.dstExtent.width * cap.dstExtent.height * 4;
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pci.queueFamilyIndex = ds.queueFamily;
+    if (dd.CreateCommandPool(dev, &pci, nullptr, &cap.pool) != VK_SUCCESS) { WFG_LOGE("capture: cmdpool failed"); return false; }
+    cap.ring.resize(kCapRing);
+    for (auto& slot : cap.ring) {
+        if (!makeOwnedImage(dd, ds.memProps, dev, cap.dstExtent, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                slot.down, slot.downMem, slot.downView)) { WFG_LOGE("capture: down image failed"); destroyCapture(cap, ds); return false; }
+        if (!makeReadbackBuffer(dd, ds.memProps, dev, cap.bufBytes, slot.buf, slot.bufMem, slot.bufPtr)) {
+            WFG_LOGE("capture: readback buffer failed"); destroyCapture(cap, ds); return false; }
+        VkCommandBufferAllocateInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ci.commandPool = cap.pool; ci.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ci.commandBufferCount = 1;
+        dd.AllocateCommandBuffers(dev, &ci, &slot.cmd);
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        dd.CreateFence(dev, &fi, nullptr, &slot.fence);
+        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        dd.CreateSemaphore(dev, &si, nullptr, &slot.doneSem);
+    }
+    winfg::CaptureConfig cc;
+    cc.mode = cfg.capMode; cc.patchSize = cfg.capPatchSize; cc.nPatches = cfg.capPatches;
+    cc.motionThresh = cfg.capMotion; cc.root = capture_root(cfg);
+    cc.srcW = (int)s.extent.width; cc.srcH = (int)s.extent.height;
+    cc.dstW = (int)cap.dstExtent.width; cc.dstH = (int)cap.dstExtent.height;
+    cc.shardCapBytes = (uint64_t)cfg.capShardMB * 1024ull * 1024ull;
+    if (!cap.engine.start(cc)) { WFG_LOGE("capture: engine start failed"); destroyCapture(cap, ds); return false; }
+    cap.ready = true; cap.ringIdx = 0; cap.captured = 0;
+    WFG_LOGI("capture ON dir=%s mode=%s target=%ux%u (src %ux%u) patches=%d patchsz=%d motion=%.2f shard=%dMB ring=%d",
+             cap.engine.sessionDir().c_str(), cfg.capMode == 0 ? "patch" : "frame",
+             cap.dstExtent.width, cap.dstExtent.height, s.extent.width, s.extent.height,
+             cfg.capPatches, cfg.capPatchSize, cfg.capMotion, cfg.capShardMB, kCapRing);
+    return true;
+}
+
+// Record + submit this present's downscale/readback into the ring; ship the slot
+// that is kCapRing presents old. Returns the doneSem the caller must route the
+// real present's wait through (or VK_NULL_HANDLE on failure — capture disabled).
+static VkSemaphore captureFrame(CaptureState& cap, DeviceState& ds, SwapState& s,
+                                uint32_t idx, const VkPresentInfoKHR* pPresentInfo,
+                                unsigned long long srcIndex) {
+    const DeviceDispatch& dd = ds.dd; VkDevice dev = ds.device;
+    CapSlot& slot = cap.ring[cap.ringIdx];
+    cap.ringIdx = (cap.ringIdx + 1) % cap.ring.size();
+    // The slot we are about to reuse holds a frame from kCapRing presents ago; its
+    // fence is (almost surely) already signaled — ship its bytes to the encoder.
+    if (slot.submitted) {
+        dd.WaitForFences(dev, 1, &slot.fence, VK_TRUE, UINT64_MAX);
+        dd.ResetFences(dev, 1, &slot.fence);
+        slot.submitted = false;
+        cap.engine.submit((const uint8_t*)slot.bufPtr, cap.dstExtent.width, cap.dstExtent.height, slot.srcIndex, slot.tsNs);
+    }
+
+    VkImage currImg = s.images[idx];
+    const VkImageLayout PS = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    const VkImageLayout TS = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    const VkImageLayout TD = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    const auto ALL = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const auto TR  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    dd.BeginCommandBuffer(slot.cmd, &bi);
+    imgBarrier(dd, slot.cmd, currImg, PS, TS, 0, VK_ACCESS_TRANSFER_READ_BIT, ALL, TR);
+    imgBarrier(dd, slot.cmd, slot.down, VK_IMAGE_LAYOUT_UNDEFINED, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, ALL, TR);
+    // Downscale blit: LINEAR filter, aspect-preserving dst. Blit maps color
+    // components semantically, so a BGRA swapchain lands correct in the RGBA8 dst.
+    VkImageBlit bl{}; bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; bl.dstSubresource = bl.srcSubresource;
+    bl.srcOffsets[1] = {(int)cap.srcExtent.width, (int)cap.srcExtent.height, 1};
+    bl.dstOffsets[1] = {(int)cap.dstExtent.width, (int)cap.dstExtent.height, 1};
+    dd.CmdBlitImage(slot.cmd, currImg, TS, slot.down, TD, 1, &bl, VK_FILTER_LINEAR);
+    imgBarrier(dd, slot.cmd, slot.down, TD, TS, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, TR, TR);
+    VkBufferImageCopy bic{}; bic.bufferOffset = 0; bic.bufferRowLength = 0; bic.bufferImageHeight = 0;
+    bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; bic.imageOffset = {0,0,0};
+    bic.imageExtent = {cap.dstExtent.width, cap.dstExtent.height, 1};
+    dd.CmdCopyImageToBuffer(slot.cmd, slot.down, TS, slot.buf, 1, &bic);
+    VkMemoryBarrier hmb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    hmb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; hmb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    dd.CmdPipelineBarrier(slot.cmd, TR, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hmb, 0, nullptr, 0, nullptr);
+    imgBarrier(dd, slot.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL);
+    dd.EndCommandBuffer(slot.cmd);
+
+    std::vector<VkPipelineStageFlags> ws(pPresentInfo->waitSemaphoreCount, ALL);
+    VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    su.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+    su.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+    su.pWaitDstStageMask = ws.empty() ? nullptr : ws.data();
+    su.commandBufferCount = 1; su.pCommandBuffers = &slot.cmd;
+    su.signalSemaphoreCount = 1; su.pSignalSemaphores = &slot.doneSem;
+    if (dd.QueueSubmit(ds.queue, 1, &su, slot.fence) != VK_SUCCESS) {
+        WFG_LOGE("capture: QueueSubmit failed — disabling capture for this swapchain");
+        cap.failed = true; cap.ready = false;
+        return VK_NULL_HANDLE;
+    }
+    slot.submitted = true; slot.srcIndex = srcIndex; slot.tsNs = now_ns();
+    if ((++cap.captured % 300ull) == 0) {
+        WFG_LOGI("capture rate: captured=%llu written=%llu patches=%llu skipped=%llu gaps=%llu drops=%llu bytes=%lluMB",
+                 (unsigned long long)cap.captured, (unsigned long long)cap.engine.written(),
+                 (unsigned long long)cap.engine.patches(), (unsigned long long)cap.engine.skipped(),
+                 (unsigned long long)cap.engine.gaps(), (unsigned long long)cap.engine.drops(),
+                 (unsigned long long)(cap.engine.bytes() >> 20));
+    }
+    return slot.doneSem;
+}
+
 template <typename T> T next_gipa(const void* pNext, VkStructureType, VkLayerFunction);
 } // namespace
 
@@ -256,7 +470,7 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     L(AllocateDescriptorSets); L(UpdateDescriptorSets);
     L(CreateCommandPool); L(DestroyCommandPool); L(AllocateCommandBuffers); L(FreeCommandBuffers);
     L(BeginCommandBuffer); L(EndCommandBuffer); L(CmdBindPipeline); L(CmdBindDescriptorSets); L(CmdDispatch);
-    L(CmdPipelineBarrier); L(CmdCopyImage); L(CmdBlitImage); L(CmdClearColorImage);
+    L(CmdPipelineBarrier); L(CmdCopyImage); L(CmdCopyImageToBuffer); L(CmdBlitImage); L(CmdClearColorImage);
     L(CreateFence); L(DestroyFence); L(WaitForFences); L(ResetFences); L(CreateSemaphore); L(DestroySemaphore);
 #undef L
 
@@ -352,6 +566,8 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
 extern "C" void VKAPI_CALL winfg_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAlloc) {
     std::lock_guard<std::mutex> lk(g_lock);
     auto& st = g_dev[dispatch_key(device)];
+    auto cit = g_cap.find(swapchain);
+    if (cit != g_cap.end()) { destroyCapture(cit->second, st); g_cap.erase(cit); }
     auto it = g_swap.find(swapchain);
     if (it != g_swap.end()) {
         destroyInsert(it->second, st);
@@ -401,14 +617,44 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
     }
     ++presents;
 
+    // ── TRAINING-DATA CAPTURE (dev mode) ─────────────────────────────────────
+    // Default OFF ⇒ the branch is one bool test and the present path below is
+    // byte-identical. When ON, capture the REAL curr swapchain image (before any
+    // interpolation; the HUD is composited downstream so this frame is clean) into
+    // an async readback ring, then route the real present's wait through capture's
+    // doneSem so the app render-finished sems are consumed exactly once.
+    const VkPresentInfoKHR* pi = pPresentInfo;
+    VkPresentInfoKHR effPresent;
+    VkSemaphore effWait[1];
+    if (st->cfg.capture && pPresentInfo->swapchainCount == 1) {
+        VkSwapchainKHR csc = pPresentInfo->pSwapchains[0];
+        uint32_t cidx = pPresentInfo->pImageIndices[0];
+        auto csit = g_swap.find(csc);
+        if (csit != g_swap.end() && cidx < csit->second.images.size()) {
+            auto& cap = g_cap[csc];
+            if (!cap.ready && !cap.failed && !initCapture(cap, *st, csit->second, st->cfg))
+                cap.failed = true;
+            if (cap.ready) {
+                VkSemaphore done = captureFrame(cap, *st, csit->second, cidx, pPresentInfo, presents);
+                if (done != VK_NULL_HANDLE) {
+                    effPresent = *pPresentInfo;
+                    effWait[0] = done;
+                    effPresent.pWaitSemaphores = effWait;
+                    effPresent.waitSemaphoreCount = 1;
+                    pi = &effPresent;   // downstream consumes doneSem, not the app sems
+                }
+            }
+        }
+    }
+
     // ── Phase 3a: synthesise the interpolated frame and blit it over the current
     // swapchain image (single present). Proves the synth on real frames on-screen;
     // true extra-frame insertion (2x) is Phase 3b. ────────────────────────────
     bool doGen = st->cfg.enabled && st->cfg.multiplier >= 2 && st->fg.valid()
-                 && pPresentInfo->swapchainCount == 1;
+                 && pi->swapchainCount == 1;
     if (doGen) {
-        VkSwapchainKHR sc = pPresentInfo->pSwapchains[0];
-        uint32_t idx = pPresentInfo->pImageIndices[0];
+        VkSwapchainKHR sc = pi->pSwapchains[0];
+        uint32_t idx = pi->pImageIndices[0];
         auto sit = g_swap.find(sc);
         auto git = g_gen.find(sc);
         if (sit != g_swap.end() && sit->second.insertReady && git != g_gen.end()
@@ -442,10 +688,10 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             dd.BeginCommandBuffer(fc.cmd, &bi);
 
             auto submitOne = [&](VkSemaphore sig) {
-                std::vector<VkPipelineStageFlags> ws(pPresentInfo->waitSemaphoreCount, ALL);
+                std::vector<VkPipelineStageFlags> ws(pi->waitSemaphoreCount, ALL);
                 VkSubmitInfo su{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                su.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
-                su.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+                su.waitSemaphoreCount = pi->waitSemaphoreCount;
+                su.pWaitSemaphores = pi->pWaitSemaphores;
                 su.pWaitDstStageMask = ws.empty() ? nullptr : ws.data();
                 su.commandBufferCount = 1; su.pCommandBuffers = &fc.cmd;
                 su.signalSemaphoreCount = 1; su.pSignalSemaphores = &sig;
@@ -508,7 +754,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 imgBarrier(dd, fc.cmd, spareImg, TD, PS, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, ALL);
                 dd.EndCommandBuffer(fc.cmd);
                 // one submit, waits app render-finished + acquire, signals gen + real present sems
-                std::vector<VkSemaphore> waits(pPresentInfo->pWaitSemaphores, pPresentInfo->pWaitSemaphores + pPresentInfo->waitSemaphoreCount);
+                std::vector<VkSemaphore> waits(pi->pWaitSemaphores, pi->pWaitSemaphores + pi->waitSemaphoreCount);
                 waits.push_back(fc.acquireSem);
                 std::vector<VkPipelineStageFlags> ws(waits.size(), ALL);
                 VkSemaphore sigs[2] = { fc.genSem, fc.currSem };
@@ -545,7 +791,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             }
         }
     }
-    return st->dd.QueuePresentKHR(queue, pPresentInfo);
+    return st->dd.QueuePresentKHR(queue, pi);
 }
 
 // ── proc addr + negotiation ──────────────────────────────────────────────────
