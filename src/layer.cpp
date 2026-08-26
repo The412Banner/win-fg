@@ -884,8 +884,21 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 if (sr != VK_SUCCESS) WFG_LOGE("P#%llu QueueSubmit(single) FAILED r=%d", presents, (int)sr);
                 return sr;
             };
-            auto presentOne = [&](VkSemaphore wait, uint32_t image) {
+            // PRESENT-ID FORWARDING (Fold8/Adreno840 wedge fix). DXVK throttles with
+            // VK_KHR_present_wait: it chains a VkPresentIdKHR onto the guest's present
+            // and then blocks in vkWaitForPresentKHR(id=N). If win-fg builds a fresh
+            // VkPresentInfoKHR with pNext=nullptr for the REAL frame, present-id N is
+            // never queued to the driver, so that wait NEVER returns → the guest
+            // present/render thread wedges forever (first insert completes clean, then
+            // no next present, force-close). Fix: forward the guest's original pNext
+            // (present-id + timing structs) onto every REAL present; the GENERATED
+            // spare present MUST pass nullptr — a generated frame may be skipped, so it
+            // must never carry a present-id (mirrors GameNative's Adreno-840 lsfg fix).
+            // present_wait is advertised on gen8/Adreno840 Turnip but not gen7/750, so
+            // this is a no-op where the guest attaches no present-id (typically the 750).
+            auto presentOne = [&](VkSemaphore wait, uint32_t image, const void* pNext) {
                 VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+                pi.pNext = pNext;
                 pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &wait;
                 pi.swapchainCount = 1; pi.pSwapchains = &sc; pi.pImageIndices = &image;
                 return st->dd.QueuePresentKHR(queue, &pi);
@@ -912,7 +925,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 s.prevValid = true;
                 if (presents < 5) WFG_LOGI("prev captured (first FG frame)");
                 WFG_LOGD(dbg, "P#%llu first-FG-frame present-real BEGIN (image=%u)", presents, idx);
-                VkResult pfr = presentOne(fc.currSem, idx);
+                VkResult pfr = presentOne(fc.currSem, idx, pPresentInfo->pNext);   // real: forward guest present-id
                 WFG_LOGD(dbg, "P#%llu first-FG-frame present-real DONE r=%d", presents, (int)pfr);
                 return pfr;
             }
@@ -1008,10 +1021,10 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 }
                 if (presents < 6) WFG_LOGI("2x insert live: spare=%u real=%u", spareIdx, idx);
                 WFG_LOGD(dbg, "P#%llu present-generated BEGIN (spare=%u)", presents, spareIdx);
-                VkResult pg = presentOne(fc.genSem, spareIdx);   // generated (in-between) frame first
+                VkResult pg = presentOne(fc.genSem, spareIdx, nullptr);   // generated frame: NEVER carry a present-id (may be skipped)
                 WFG_LOGD(dbg, "P#%llu present-generated DONE r=%d", presents, (int)pg);
                 WFG_LOGD(dbg, "P#%llu present-real BEGIN (image=%u)", presents, idx);
-                VkResult prr = presentOne(fc.currSem, idx);      // then the real frame
+                VkResult prr = presentOne(fc.currSem, idx, pPresentInfo->pNext);   // real: forward guest present-id (retires vkWaitForPresentKHR)
                 WFG_LOGD(dbg, "P#%llu present-real DONE r=%d", presents, (int)prr);
                 // Unambiguous last win-fg line before the guest thread runs its NEXT
                 // call — which the guest-acquire/guest-submit hooks then catch. If a
@@ -1049,7 +1062,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                     return ptr;
                 }
                 WFG_LOGD(dbg, "P#%llu fallback present-real BEGIN (image=%u)", presents, idx);
-                VkResult prf = presentOne(fc.currSem, idx);
+                VkResult prf = presentOne(fc.currSem, idx, pPresentInfo->pNext);   // real: forward guest present-id
                 WFG_LOGD(dbg, "P#%llu fallback present-real DONE r=%d", presents, (int)prf);
                 return prf;
             }
