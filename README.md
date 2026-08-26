@@ -81,6 +81,7 @@ Set via `conf.toml` (hot-reloaded live) or `WIN_FG_*` env vars.
 | `fr_dt` | `WIN_FG_FR_DT` | `0.25` | smoothing step (higher ⇒ smoother, risks soft edges) |
 | `fr_edge` | `WIN_FG_FR_EDGE` | `8.0` | luma-gradient edge sensitivity |
 | `fr_eps` | `WIN_FG_FR_EPS` | `0.05` | Charbonnier epsilon (px) |
+| `debug` | `WIN_FG_DEBUG` | `off` | `on`/`off` — granular per-frame present-path trace to logcat (tag `win-fg`) for freeze/crash-on-enable triage; default off = zero overhead |
 | `global_motion`/`flow_reg` `off` | | | ⇒ byte-identical to the layer without that stage |
 
 `WIN_FG_ASYNC` (async-compute path) exists but is **parked** — on a

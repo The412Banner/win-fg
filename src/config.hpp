@@ -13,6 +13,14 @@ namespace winfg {
 
 struct Config {
     bool     enabled     = false;  // gate; loader also honours the manifest enable var
+    // GRANULAR PRESENT-PATH DEBUG TRACE. Default OFF. When ON, winfg_QueuePresentKHR
+    // emits a per-frame, step-by-step trail (logcat tag "win-fg") so a freeze/
+    // crash-on-enable leaves an obvious LAST line at the exact stage that hung or
+    // faulted (acquire-spare, compute-submit, present-generated/real, fence wait,
+    // fallback). Zero behaviour change and effectively zero cost when off — one
+    // predicted-not-taken bool test per step, no logcat writes.
+    // WIN_FG_DEBUG=1|0 / conf.toml debug=on|off.
+    bool     debug       = false;
     int      model       = 4;      // 3 = symmetric flow, 4 = bidir + occlusion gate
     int      multiplier  = 2;      // generated presents per real present + 1
     float    flowScale   = 1.0f;   // scales solved flow magnitude
@@ -159,6 +167,7 @@ static inline void apply_toml(Config& c, const std::string& path) {
         std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
         if (k.empty() || v.empty()) continue;
         if      (k == "enabled")    c.enabled = (v == "1" || v == "true");
+        else if (k == "debug")      c.debug = parse_bool(v, c.debug);
         else if (k == "model")      c.model = std::atoi(v.c_str());
         else if (k == "multiplier") c.multiplier = std::atoi(v.c_str());
         else if (k == "global_motion") c.gmMode = parse_tristate(v, c.gmMode);
@@ -218,6 +227,7 @@ static inline std::string capture_root(const Config& c) {
 static inline Config load_config() {
     Config c;
     c.enabled    = envi("WIN_FG_ENABLE", 0) != 0;
+    if (const char* d = std::getenv("WIN_FG_DEBUG")) c.debug = parse_bool(d, c.debug);
     c.model      = envi("WIN_FG_MODEL", c.model);
     c.multiplier = envi("WIN_FG_MULT", c.multiplier);
     if (const char* g = std::getenv("WIN_FG_GM")) c.gmMode = parse_tristate(g, c.gmMode);

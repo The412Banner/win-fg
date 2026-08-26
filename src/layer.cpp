@@ -223,6 +223,27 @@ static uint64_t now_ns() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Human names for the device-context fingerprint log (Fold8/Adreno840 vs AYANEO/750).
+static const char* driverIdName(VkDriverId id) {
+    switch (id) {
+        case VK_DRIVER_ID_MESA_TURNIP:          return "MESA_TURNIP";
+        case VK_DRIVER_ID_QUALCOMM_PROPRIETARY: return "QUALCOMM_PROPRIETARY";
+        case VK_DRIVER_ID_ARM_PROPRIETARY:      return "ARM_PROPRIETARY";
+        case VK_DRIVER_ID_MESA_VENUS:           return "MESA_VENUS";
+        case VK_DRIVER_ID_MESA_DOZEN:           return "MESA_DOZEN";
+        default:                                return "other";
+    }
+}
+static const char* presentModeName(VkPresentModeKHR m) {
+    switch (m) {
+        case VK_PRESENT_MODE_IMMEDIATE_KHR:    return "IMMEDIATE";
+        case VK_PRESENT_MODE_MAILBOX_KHR:      return "MAILBOX";
+        case VK_PRESENT_MODE_FIFO_KHR:         return "FIFO";
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+        default:                               return "other";
+    }
+}
+
 // Aspect-preserving downscale target that never upscales; dims rounded to >=2 even.
 static VkExtent2D computeDstExtent(VkExtent2D src, int targetW, int targetH) {
     double sw = src.width ? (double)targetW / src.width : 1.0;
@@ -379,9 +400,12 @@ static VkSemaphore captureFrame(CaptureState& cap, DeviceState& ds, SwapState& s
     // The slot we are about to reuse holds a frame from kCapRing presents ago; its
     // fence is (almost surely) already signaled — ship its bytes to the encoder.
     if (slot.submitted) {
+        WFG_LOGD(ds.cfg.debug, "P#%llu capture ship-old-slot fence-wait BEGIN (src=%llu)",
+                 srcIndex, (unsigned long long)slot.srcIndex);
         dd.WaitForFences(dev, 1, &slot.fence, VK_TRUE, UINT64_MAX);
         dd.ResetFences(dev, 1, &slot.fence);
         slot.submitted = false;
+        WFG_LOGD(ds.cfg.debug, "P#%llu capture ship-old-slot fence-wait DONE", srcIndex);
         cap.engine.submit((const uint8_t*)slot.bufPtr, cap.dstExtent.width, cap.dstExtent.height, slot.srcIndex, slot.tsNs);
     }
 
@@ -464,6 +488,10 @@ extern "C" VkResult VKAPI_CALL winfg_CreateInstance(
     d.DestroyInstance = (PFN_vkDestroyInstance)gipa(*pInstance, "vkDestroyInstance");
     d.GetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)gipa(*pInstance, "vkGetPhysicalDeviceMemoryProperties");
     d.GetPhysicalDeviceQueueFamilyProperties = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)gipa(*pInstance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    d.GetPhysicalDeviceProperties = (PFN_vkGetPhysicalDeviceProperties)gipa(*pInstance, "vkGetPhysicalDeviceProperties");
+    d.GetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)gipa(*pInstance, "vkGetPhysicalDeviceProperties2");
+    if (!d.GetPhysicalDeviceProperties2)  // 1.0 instance: fall back to the KHR alias if the ext is present
+        d.GetPhysicalDeviceProperties2 = (PFN_vkGetPhysicalDeviceProperties2)gipa(*pInstance, "vkGetPhysicalDeviceProperties2KHR");
     std::lock_guard<std::mutex> lk(g_lock);
     g_inst[dispatch_key(*pInstance)] = d;
     g_instHandle[dispatch_key(*pInstance)] = *pInstance;
@@ -534,6 +562,37 @@ extern "C" VkResult VKAPI_CALL winfg_CreateDevice(
     dd.GetDeviceQueue(*pDevice, st.queueFamily, 0, &st.queue);
     st.device = *pDevice;
     st.id->GetPhysicalDeviceMemoryProperties(phys, &st.memProps);
+
+    // ── DEVICE-CONTEXT FINGERPRINT (always logged; once per device, no per-frame
+    // spam). The exact profile of the affected device — GPU, driver + driverID +
+    // version, and the compute queue-family layout — so a broken Fold8/Adreno840/
+    // Wrapper build can be compared against a known-good AYANEO/Adreno750. ────────
+    {
+        VkPhysicalDeviceProperties props{};
+        if (st.id->GetPhysicalDeviceProperties) st.id->GetPhysicalDeviceProperties(phys, &props);
+        const char* drvName = "?"; VkDriverId drvId = (VkDriverId)0;
+        if (st.id->GetPhysicalDeviceProperties2) {
+            VkPhysicalDeviceDriverProperties dp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            p2.pNext = &dp;
+            st.id->GetPhysicalDeviceProperties2(phys, &p2);
+            drvName = dp.driverName[0] ? dp.driverName : "?";
+            drvId   = dp.driverID;
+        }
+        WFG_LOGI("DEVICE-CTX gpu=\"%s\" vendorID=0x%04x deviceID=0x%04x api=%u.%u.%u "
+                 "driver=\"%s\" driverID=%d(%s) driverVersion=0x%08x computeQF=%u qfCount=%u",
+                 props.deviceName, props.vendorID, props.deviceID,
+                 VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
+                 VK_API_VERSION_PATCH(props.apiVersion), drvName, (int)drvId, driverIdName(drvId),
+                 props.driverVersion, st.queueFamily, qfc);
+        for (uint32_t i = 0; i < qfc; ++i) {
+            VkQueueFlags f = qf[i].queueFlags;
+            WFG_LOGI("DEVICE-CTX  qf[%u] count=%u flags=0x%x [%s%s%s%s]", i, qf[i].queueCount, f,
+                     (f & VK_QUEUE_GRAPHICS_BIT) ? "G" : "", (f & VK_QUEUE_COMPUTE_BIT) ? "C" : "",
+                     (f & VK_QUEUE_TRANSFER_BIT) ? "T" : "", (f & VK_QUEUE_SPARSE_BINDING_BIT) ? "S" : "");
+        }
+    }
+
     g_dev[dispatch_key(*pDevice)] = std::move(st);
     auto& ds = g_dev[dispatch_key(*pDevice)];
     WFG_LOGI("CreateDevice ok (enable=%d model=%d mult=%d flowScale=%.2f computeQF=%u)",
@@ -591,6 +650,18 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
     }
     WFG_LOGI("CreateSwapchain %ux%u fmt=%d images=%u (enabled=%d)",
              s.extent.width, s.extent.height, (int)s.format, n, st.cfg.enabled);
+    // ── SWAPCHAIN-CONTEXT FINGERPRINT (always logged; once per swapchain). The
+    // present-mode + image-count + usage shape drives the spare-image insert path;
+    // if the +1 minImageCount fell back (driver rejected the bump) the game holds
+    // more images in flight and 2x insert starves — this line says which case we
+    // are in on the affected device. ────────────────────────────────────────────
+    WFG_LOGI("SWAPCHAIN-CTX %ux%u fmt=%d colorSpace=%d presentMode=%d(%s) "
+             "minImageCount(app=%u requested=%u) actualImages=%u usage(app=0x%x forced=0x%x) "
+             "spare+1=%s enabled=%d debug=%d",
+             s.extent.width, s.extent.height, (int)s.format, (int)pCreateInfo->imageColorSpace,
+             (int)pCreateInfo->presentMode, presentModeName(pCreateInfo->presentMode),
+             origMin, ci.minImageCount, n, pCreateInfo->imageUsage, ci.imageUsage,
+             (ci.minImageCount > origMin) ? "granted" : "FELL-BACK", st.cfg.enabled, st.cfg.debug);
     // Always initialise the compute engine when the layer is loaded (not gated on
     // enabled), so the pipelines/pyramids build up-front and a live in-game enable
     // has nothing left to set up. Proves the compute path on Turnip even while idle.
@@ -636,6 +707,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
     auto it = g_dev.find(dispatch_key(queue));
     if (it == g_dev.end()) return VK_ERROR_DEVICE_LOST;
     DeviceState* st = &it->second;
+    const bool dbg = st->cfg.debug;   // granular present-path trace gate (default off)
 
     // Hot-reload conf.toml so the in-game controls (enable / multiplier / model /
     // flow scale) reach the layer live. Cheap stat every present; only re-read the
@@ -662,6 +734,9 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
         lastEnabled = en;
     }
     ++presents;
+    WFG_LOGD(dbg, "P#%llu present-enter: enabled=%d mult=%d fg.valid=%d capture=%d swapCount=%u",
+             presents, en, st->cfg.multiplier, st->fg.valid() ? 1 : 0,
+             st->cfg.capture ? 1 : 0, pPresentInfo->swapchainCount);
 
     // ── TRAINING-DATA CAPTURE (dev mode) ─────────────────────────────────────
     // Default OFF ⇒ the branch is one bool test and the present path below is
@@ -681,7 +756,10 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             if (!cap.ready && !cap.failed && !initCapture(cap, *st, csit->second, st->cfg))
                 cap.failed = true;
             if (cap.ready) {
+                WFG_LOGD(dbg, "P#%llu capture-frame BEGIN (idx=%u)", presents, cidx);
                 VkSemaphore done = captureFrame(cap, *st, csit->second, cidx, pPresentInfo, presents);
+                WFG_LOGD(dbg, "P#%llu capture-frame DONE (doneSem=%s)", presents,
+                         done != VK_NULL_HANDLE ? "routed" : "null/failed");
                 if (done != VK_NULL_HANDLE) {
                     effPresent = *pPresentInfo;
                     effWait[0] = done;
@@ -701,6 +779,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
     if (doGen) {
         VkSwapchainKHR sc = pi->pSwapchains[0];
         uint32_t idx = pi->pImageIndices[0];
+        WFG_LOGD(dbg, "P#%llu fg-path enter (image idx=%u)", presents, idx);
         auto sit = g_swap.find(sc);
         auto git = g_gen.find(sc);
         if (sit != g_swap.end() && sit->second.insertReady && git != g_gen.end()
@@ -713,9 +792,16 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             uint32_t fcIdx = s.ringIdx;                 // C1: this slot indexes the GM SSBO to read/reduce
             FrameCtx& fc = s.ring[fcIdx];
             s.ringIdx = (s.ringIdx + 1) % s.ring.size();
+            WFG_LOGD(dbg, "P#%llu fg-generate (prevValid=%d ring-slot=%u fc.submitted=%d)",
+                     presents, s.prevValid ? 1 : 0, fcIdx, fc.submitted ? 1 : 0);
             // Waiting fc.fence guarantees this slot's PREVIOUS reduce (its SSBO
             // write) has completed, so record() can safely read it back on the host.
-            if (fc.submitted) { dd.WaitForFences(dev, 1, &fc.fence, VK_TRUE, UINT64_MAX); dd.ResetFences(dev, 1, &fc.fence); fc.submitted = false; }
+            if (fc.submitted) {
+                WFG_LOGD(dbg, "P#%llu ring-fence wait BEGIN (slot=%u, infinite timeout)", presents, fcIdx);
+                dd.WaitForFences(dev, 1, &fc.fence, VK_TRUE, UINT64_MAX);
+                dd.ResetFences(dev, 1, &fc.fence); fc.submitted = false;
+                WFG_LOGD(dbg, "P#%llu ring-fence wait DONE", presents);
+            }
 
             VkImage currImg = s.images[idx];
             VkImageView currView = s.views[idx];
@@ -741,7 +827,9 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 su.pWaitDstStageMask = ws.empty() ? nullptr : ws.data();
                 su.commandBufferCount = 1; su.pCommandBuffers = &fc.cmd;
                 su.signalSemaphoreCount = 1; su.pSignalSemaphores = &sig;
-                dd.QueueSubmit(st->queue, 1, &su, fc.fence); fc.submitted = true;
+                VkResult sr = dd.QueueSubmit(st->queue, 1, &su, fc.fence); fc.submitted = true;
+                WFG_LOGD(dbg, "P#%llu compute-submit(single) DONE r=%d", presents, (int)sr);
+                if (sr != VK_SUCCESS) WFG_LOGE("P#%llu QueueSubmit(single) FAILED r=%d", presents, (int)sr);
             };
             auto presentOne = [&](VkSemaphore wait, uint32_t image) {
                 VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -752,22 +840,29 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
 
             if (!s.prevValid) {
                 // first FG frame: capture curr -> prev, present curr unchanged
+                WFG_LOGD(dbg, "P#%llu first-FG-frame: record curr->prev copy (no gen this frame)", presents);
                 imgBarrier(dd, fc.cmd, currImg, PS, TS, 0, VK_ACCESS_TRANSFER_READ_BIT, ALL, TR);
                 imgBarrier(dd, fc.cmd, s.prevImg, VK_IMAGE_LAYOUT_UNDEFINED, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, TR);
                 dd.CmdCopyImage(fc.cmd, currImg, TS, s.prevImg, TD, 1, &cp);
                 imgBarrier(dd, fc.cmd, s.prevImg, TD, SR, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, TR, CS);
                 imgBarrier(dd, fc.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL);
                 dd.EndCommandBuffer(fc.cmd);
+                WFG_LOGD(dbg, "P#%llu first-FG-frame compute-submit BEGIN", presents);
                 submitOne(fc.currSem);
                 s.prevValid = true;
                 if (presents < 5) WFG_LOGI("prev captured (first FG frame)");
-                return presentOne(fc.currSem, idx);
+                WFG_LOGD(dbg, "P#%llu first-FG-frame present-real BEGIN (image=%u)", presents, idx);
+                VkResult pfr = presentOne(fc.currSem, idx);
+                WFG_LOGD(dbg, "P#%llu first-FG-frame present-real DONE r=%d", presents, (int)pfr);
+                return pfr;
             }
 
             // ── generate the in-between frame; try to insert it as an EXTRA present (2x) ──
             uint32_t spareIdx = 0;
+            WFG_LOGD(dbg, "P#%llu acquire-spare BEGIN (timeout=2ms)", presents);
             VkResult ar = dd.AcquireNextImageKHR(dev, sc, 2000000ull, fc.acquireSem, VK_NULL_HANDLE, &spareIdx);
             bool insert = (ar == VK_SUCCESS || ar == VK_SUBOPTIMAL_KHR) && spareIdx < s.images.size();
+            WFG_LOGD(dbg, "P#%llu acquire-spare RESULT ar=%d spareIdx=%u insert=%d", presents, (int)ar, spareIdx, insert ? 1 : 0);
             // Diagnostic: 2x insert vs 3a blit-over fallback. If fallback climbs during
             // motion, the spare-image acquire is starving -> every frame becomes the soft
             // interpolated one -> blur (which a bg/fg swapchain recreate would reset).
@@ -783,7 +878,9 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
             // Biasing to 0.35 (closer to prev) reduces the visible double-exposure at the
             // cost of some pacing accuracy; the synth crossfade fallback also blends less
             // aggressively. Iterative bring-up knob — sits alongside the swapchain+1 fix.
+            WFG_LOGD(dbg, "P#%llu gen-record BEGIN (flow+synth compute, alpha=0.35 slot=%u)", presents, fcIdx);
             st->fg.record(fc.cmd, s.prevView, currView, gt.view, 0.35f, fcIdx);       // synth -> gen (rgba8); fcIdx = C1 GM slot
+            WFG_LOGD(dbg, "P#%llu gen-record DONE", presents);
             imgBarrier(dd, fc.cmd, gt.img, VK_IMAGE_LAYOUT_GENERAL, TS, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
             imgBarrier(dd, fc.cmd, currImg, SR, TS, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT, CS, TR);
             imgBarrier(dd, fc.cmd, s.prevImg, SR, TD, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, CS, TR);
@@ -796,6 +893,7 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 imgBarrier(dd, fc.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL); // real frame -> present, untouched
                 VkImage spareImg = s.images[spareIdx];
                 imgBarrier(dd, fc.cmd, spareImg, VK_IMAGE_LAYOUT_UNDEFINED, TD, 0, VK_ACCESS_TRANSFER_WRITE_BIT, ALL, TR);
+                WFG_LOGD(dbg, "P#%llu gen-blit gen->spare (spareIdx=%u)", presents, spareIdx);
                 dd.CmdBlitImage(fc.cmd, gt.img, TS, spareImg, TD, 1, &bl, VK_FILTER_NEAREST);      // generated -> spare image
                 imgBarrier(dd, fc.cmd, spareImg, TD, PS, VK_ACCESS_TRANSFER_WRITE_BIT, 0, TR, ALL);
                 dd.EndCommandBuffer(fc.cmd);
@@ -808,10 +906,19 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 su.waitSemaphoreCount = (uint32_t)waits.size(); su.pWaitSemaphores = waits.data(); su.pWaitDstStageMask = ws.data();
                 su.commandBufferCount = 1; su.pCommandBuffers = &fc.cmd;
                 su.signalSemaphoreCount = 2; su.pSignalSemaphores = sigs;
-                dd.QueueSubmit(st->queue, 1, &su, fc.fence); fc.submitted = true;
+                WFG_LOGD(dbg, "P#%llu compute-submit BEGIN (insert: %u waits +acquire, 2 sig sems)",
+                         presents, pi->waitSemaphoreCount);
+                VkResult isr = dd.QueueSubmit(st->queue, 1, &su, fc.fence); fc.submitted = true;
+                WFG_LOGD(dbg, "P#%llu compute-submit DONE r=%d (insert)", presents, (int)isr);
+                if (isr != VK_SUCCESS) WFG_LOGE("P#%llu insert QueueSubmit FAILED r=%d", presents, (int)isr);
                 if (presents < 6) WFG_LOGI("2x insert live: spare=%u real=%u", spareIdx, idx);
-                presentOne(fc.genSem, spareIdx);            // generated (in-between) frame first
-                return presentOne(fc.currSem, idx);         // then the real frame
+                WFG_LOGD(dbg, "P#%llu present-generated BEGIN (spare=%u)", presents, spareIdx);
+                VkResult pg = presentOne(fc.genSem, spareIdx);   // generated (in-between) frame first
+                WFG_LOGD(dbg, "P#%llu present-generated DONE r=%d", presents, (int)pg);
+                WFG_LOGD(dbg, "P#%llu present-real BEGIN (image=%u)", presents, idx);
+                VkResult prr = presentOne(fc.currSem, idx);      // then the real frame
+                WFG_LOGD(dbg, "P#%llu present-real DONE r=%d", presents, (int)prr);
+                return prr;
             } else {
                 // No spare image available -> we cannot true-2x this frame.
                 // Old behavior: blit the synthesized frame over curr and present
@@ -830,14 +937,27 @@ extern "C" VkResult VKAPI_CALL winfg_QueuePresentKHR(VkQueue queue, const VkPres
                 // Net effect of a fallback: one plain real frame instead of one
                 // ghosted frame. Invisible to the user; the 2x FPS boost only
                 // pauses for that single present.
+                WFG_LOGD(dbg, "P#%llu spare-starve -> 3a fallback (present real untouched, ar=%d)", presents, (int)ar);
                 imgBarrier(dd, fc.cmd, currImg, TS, PS, VK_ACCESS_TRANSFER_READ_BIT, 0, TR, ALL);
                 dd.EndCommandBuffer(fc.cmd);
+                WFG_LOGD(dbg, "P#%llu fallback compute-submit BEGIN", presents);
                 submitOne(fc.currSem);
-                return presentOne(fc.currSem, idx);
+                WFG_LOGD(dbg, "P#%llu fallback present-real BEGIN (image=%u)", presents, idx);
+                VkResult prf = presentOne(fc.currSem, idx);
+                WFG_LOGD(dbg, "P#%llu fallback present-real DONE r=%d", presents, (int)prf);
+                return prf;
             }
+        } else {
+            WFG_LOGD(dbg, "P#%llu fg-path NOT-ready -> passthrough (swapFound=%d insertReady=%d genFound=%d)",
+                     presents, (sit != g_swap.end()) ? 1 : 0,
+                     (sit != g_swap.end() && sit->second.insertReady) ? 1 : 0,
+                     (git != g_gen.end()) ? 1 : 0);
         }
     }
-    return st->dd.QueuePresentKHR(queue, pi);
+    WFG_LOGD(dbg, "P#%llu passthrough present-real BEGIN (doGen=%d)", presents, doGen ? 1 : 0);
+    VkResult ptr = st->dd.QueuePresentKHR(queue, pi);
+    WFG_LOGD(dbg, "P#%llu passthrough present-real DONE r=%d", presents, (int)ptr);
+    return ptr;
 }
 
 // ── proc addr + negotiation ──────────────────────────────────────────────────

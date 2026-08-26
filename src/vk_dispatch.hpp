@@ -20,6 +20,10 @@ struct InstanceDispatch {
     PFN_vkDestroyInstance              DestroyInstance = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties = nullptr;
+    // Device-context logging (affected-device fingerprint). Properties2 is core 1.1;
+    // may be null on a 1.0 instance — always null-check before calling.
+    PFN_vkGetPhysicalDeviceProperties  GetPhysicalDeviceProperties = nullptr;
+    PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2 = nullptr;
 };
 
 // Device-level functions we call. Populated by walking vkGetDeviceProcAddr on
