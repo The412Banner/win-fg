@@ -739,6 +739,22 @@ extern "C" VkResult VKAPI_CALL winfg_CreateSwapchainKHR(
         st.fgInited = ok;
         if (!ok) WFG_LOGE("framegen init FAILED — FG will not run this swapchain");
     }
+    // Swapchain RECREATE (fgInited already true — e.g. the app's FG-change surface teardown +
+    // rebuild) re-reads a conf.toml the app may have just rewritten (perf_preset) and CLEARS the
+    // mtime, so THIS recreate applies the new config once and the present hook does NOT then fire a
+    // second configure()+onResize(force) on the fresh swapchain. That redundant double-rebuild is
+    // what collides on the guest surface and freezes the present path when a perf-preset change is
+    // routed through the app teardown (Adreno-840 Fold: screen freezes on the last frame while
+    // audio/input keep running). No-op on first init and when the conf is unchanged.
+    if (st.fgInited) {
+        long long m = stat_mtime(st.confPath);
+        if (m != 0 && m != st.confMtime) {
+            st.confMtime = m;
+            st.cfg = load_config();
+            st.fg.configure(st.cfg);   // recompute kFlowFinest from the new perf_preset (live rebuild)
+            WFG_LOGI("swapchain recreate: applied live conf (perf_preset=%d) + cleared mtime", st.cfg.perfPreset);
+        }
+    }
     if (st.fgInited) {
         if (!st.fg.onResize(s.extent, s.format))
             WFG_LOGE("framegen onResize FAILED for %ux%u", s.extent.width, s.extent.height);
