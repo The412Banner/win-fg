@@ -1,0 +1,9 @@
+// Auto-generated from version_stamp.cpp.in by CMake configure_file — DO NOT EDIT.
+// Self-identifying build stamp so a shipped libwin_fg.so reveals its exact source:
+//     strings libwin_fg.so | grep win-fg-build
+//     nm -D  libwin_fg.so  | grep win_fg_build_version
+// The symbol is marked `used` + default visibility so it survives dead-strip and
+// the hidden-visibility preset, and stays discoverable in the dynamic symbol table.
+extern "C" __attribute__((used, visibility("default")))
+const char win_fg_build_version[] =
+    "win-fg-build @WINFG_GIT_DESCRIBE@ @WINFG_BUILD_DATE@";
