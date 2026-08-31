@@ -20,6 +20,13 @@ struct InstanceDispatch {
     PFN_vkDestroyInstance              DestroyInstance = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties = nullptr;
+    // Device-context logging (affected-device fingerprint). Properties2 is core 1.1;
+    // may be null on a 1.0 instance — always null-check before calling.
+    PFN_vkGetPhysicalDeviceProperties  GetPhysicalDeviceProperties = nullptr;
+    PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2 = nullptr;
+    // Surface caps — used to clamp the extra-image-headroom request to the surface's
+    // maxImageCount so the bump never exceeds what the driver can grant.
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
 };
 
 // Device-level functions we call. Populated by walking vkGetDeviceProcAddr on
@@ -29,6 +36,11 @@ struct DeviceDispatch {
     PFN_vkDestroyDevice                DestroyDevice = nullptr;
     PFN_vkGetDeviceQueue               GetDeviceQueue = nullptr;
     PFN_vkQueueSubmit                  QueueSubmit = nullptr;
+    // Synchronization2 submit path (core 1.3 + KHR alias). DXVK may use either the
+    // legacy QueueSubmit or QueueSubmit2/2KHR; both are hooked for the guest-submit
+    // diagnostic. May be null if the device did not enable them — always null-check.
+    PFN_vkQueueSubmit2                 QueueSubmit2 = nullptr;
+    PFN_vkQueueSubmit2KHR              QueueSubmit2KHR = nullptr;
     PFN_vkQueueWaitIdle                QueueWaitIdle = nullptr;
     PFN_vkDeviceWaitIdle               DeviceWaitIdle = nullptr;
 
@@ -37,6 +49,10 @@ struct DeviceDispatch {
     PFN_vkDestroySwapchainKHR          DestroySwapchainKHR = nullptr;
     PFN_vkGetSwapchainImagesKHR        GetSwapchainImagesKHR = nullptr;
     PFN_vkAcquireNextImageKHR          AcquireNextImageKHR = nullptr;
+    // Alternate acquire entry (VK_KHR_swapchain 1.1+ / device-group). DXVK may use
+    // either AcquireNextImageKHR or AcquireNextImage2KHR — both hooked for the
+    // guest-acquire diagnostic. May be null — always null-check.
+    PFN_vkAcquireNextImage2KHR         AcquireNextImage2KHR = nullptr;
     PFN_vkQueuePresentKHR              QueuePresentKHR = nullptr;
 
     // resources
@@ -68,6 +84,11 @@ struct DeviceDispatch {
     PFN_vkDestroyPipeline              DestroyPipeline = nullptr;
     PFN_vkCreateDescriptorPool         CreateDescriptorPool = nullptr;
     PFN_vkDestroyDescriptorPool        DestroyDescriptorPool = nullptr;
+    // Frees every set in the pool at once — used by FrameGen::configure() to reclaim
+    // the old scratch descriptor sets when a perf_preset change forces a live rebuild
+    // (otherwise repeated preset switches would exhaust the pool). May be null in
+    // theory; the rebuild path null-checks before calling.
+    PFN_vkResetDescriptorPool          ResetDescriptorPool = nullptr;
     PFN_vkAllocateDescriptorSets       AllocateDescriptorSets = nullptr;
     PFN_vkUpdateDescriptorSets         UpdateDescriptorSets = nullptr;
 
@@ -83,6 +104,7 @@ struct DeviceDispatch {
     PFN_vkCmdDispatch                  CmdDispatch = nullptr;
     PFN_vkCmdPipelineBarrier           CmdPipelineBarrier = nullptr;
     PFN_vkCmdCopyImage                 CmdCopyImage = nullptr;
+    PFN_vkCmdCopyImageToBuffer         CmdCopyImageToBuffer = nullptr;  // capture readback
     PFN_vkCmdBlitImage                 CmdBlitImage = nullptr;
     PFN_vkCmdClearColorImage           CmdClearColorImage = nullptr;
     PFN_vkCreateFence                  CreateFence = nullptr;

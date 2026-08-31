@@ -46,7 +46,7 @@ struct ScratchState {
     VkDescriptorSet sSynth = VK_NULL_HANDLE;
     // C1: per-slot reduce set + per-slot per-level prewarp sets
     VkDescriptorSet sGmReduce[winfg::FrameGen::kGmSlots]{};
-    std::vector<VkDescriptorSet> sGmPrewarp[winfg::FrameGen::kGmSlots]; // sized kLevels; [kFlowFinest..) used
+    std::vector<VkDescriptorSet> sGmPrewarp[winfg::FrameGen::kGmSlots]; // sized kLevels; [flowFinest()..) used
     VkExtent2D builtFor{0,0};
     bool built = false;
     bool flowInited = false;   // flow images laid out once, then persist (temporal predictor)
@@ -167,6 +167,75 @@ static bool ensureScratch(FrameGen* fg, const DeviceDispatch* dd, VkDevice dev,
                           const FrameGen::Pipe& pGmPrewarp, const FrameGen::Pipe& pFlowReg,
                           FrameGen::Img& flowRegA, FrameGen::Img& flowRegB, VkBuffer* gmSsbo,
                           int kLevels, const Config& cfg);
+
+// Tear down the lazily-built scratch (all UBO buffers + every descriptor set) so a
+// live perf_preset rebuild neither leaks them nor exhausts the descriptor pool.
+// The CALLER must have made the device idle first — no in-flight command buffer may
+// still reference these. Resetting the pool frees every set FrameGen allocated (all
+// sets come from this pool); the mapped UBO memory is unmapped + freed explicitly.
+static void destroyScratch(const DeviceDispatch* dd, VkDevice dev, VkDescriptorPool pool) {
+    auto freeUbo = [&](VkBuffer& b, VkDeviceMemory& m, void*& p) {
+        if (m) dd->UnmapMemory(dev, m);
+        if (b) dd->DestroyBuffer(dev, b, nullptr);
+        if (m) dd->FreeMemory(dev, m, nullptr);
+        b = VK_NULL_HANDLE; m = VK_NULL_HANDLE; p = nullptr;
+    };
+    auto& S = g_scratch;
+    freeUbo(S.synthUbo,   S.synthUboMem,   S.synthUboPtr);
+    freeUbo(S.expandUbo,  S.expandUboMem,  S.expandUboPtr);
+    freeUbo(S.flowRegUbo, S.flowRegUboMem, S.flowRegUboPtr);
+    for (size_t i = 0; i < S.flowUbo.size(); ++i) freeUbo(S.flowUbo[i], S.flowUboMem[i], S.flowUboPtr[i]);
+    for (int s = 0; s < FrameGen::kGmSlots; ++s) freeUbo(S.gmUbo[s], S.gmUboMem[s], S.gmUboPtr[s]);
+    if (pool && dd->ResetDescriptorPool) dd->ResetDescriptorPool(dev, pool, 0);  // reclaim all sets at once
+    S = ScratchState{};   // built=false -> next record() rebuilds via ensureScratch
+}
+
+// ── perf_preset apply / live rebuild ─────────────────────────────────────────
+// Sets the config, resolves the perf_preset -> finest-solved-level, and — when
+// that level changed while resources are already live — safely rebuilds the
+// affected per-size flow images (a resize) + scratch descriptor sets and resets
+// the flow predictor. This makes a perf_preset change FULLY LIVE per-present (the
+// conf.toml hot-reload path calls this), so no FG toggle / bg-fg cycle is needed.
+void FrameGen::configure(const Config& c) {
+    cfg_ = c; cfg_.sanitize();
+    // Map preset -> finest level, clamped so at least TWO solved levels always
+    // remain (coarse->fine needs a range). With kLevels=7 the presets (1/2/3) never
+    // hit the clamp; the guard is defensive for future level/preset tuning.
+    int want = flowFinestForPreset(cfg_.perfPreset);
+    const int maxFinest = kLevels - 2;   // keep >= 2 solved levels
+    if (want > maxFinest) {
+        WFG_LOGE("perf-preset=%d wants kFlowFinest=%d but only %d pyramid levels exist "
+                 "(need >=2 solved) — clamping to %d", cfg_.perfPreset, want, kLevels, maxFinest);
+        want = maxFinest;
+    }
+    if (want < 1) want = 1;              // never solve full-res (level 0)
+
+    const int prevFinest = flowFinest_;
+    flowFinest_ = want;
+    const bool live = (flowFinest_ != prevFinest) && ready_;
+    WFG_LOGI("perf-preset=%d -> kFlowFinest=%d (was %d) live-rebuild=%d ready=%d",
+             cfg_.perfPreset, flowFinest_, prevFinest, live ? 1 : 0, ready_ ? 1 : 0);
+
+    if (!live) return;   // unchanged, or not yet built (initial configure before onResize)
+
+    // The per-size flow images (pyrAs_/flowReg*/flowLvl_ wiring) and the scratch
+    // descriptor sets were built for the OLD finest level. Rebuild them so record()
+    // never reads/writes mismatched-size images.
+    dd_->DeviceWaitIdle(device_);            // no in-flight cmd buf may touch these
+    destroyScratch(dd_, device_, descPool_); // free old scratch (UBOs + all sets)
+    if (!onResize(extent_, VK_FORMAT_UNDEFINED, /*force=*/true))
+        WFG_LOGE("perf-preset live rebuild: onResize FAILED at %ux%u — FG disabled until next resize",
+                 extent_.width, extent_.height);
+    // Reset the persistent flow predictor so stale, differently-scaled state never
+    // feeds the new resolution (avoids a melt/garbage frame on switch). The per-frame
+    // flow field (flowLvl_) is already cleared every frame; the cross-frame state is
+    // the C1 global-motion estimate + its per-slot reduce partials (dispatched against
+    // the old pyramid) — drop both back to identity.
+    for (int i = 0; i < 6; ++i) gmRun_[i] = 0.0;
+    for (int s = 0; s < kGmSlots; ++s) { gmSlotValid_[s] = false; for (int i = 0; i < 6; ++i) gmLinAt_[s][i] = 0.0; }
+    gmHaveEst_ = false; gmEngaged_ = false; gmStableCount_ = 0; gmLastTransPx_ = 0.0f;
+    WFG_LOGI("perf-preset live rebuild DONE (kFlowFinest=%d, flow predictor reset)", flowFinest_);
+}
 
 // ── C1: read back one reduce SSBO, run one inverse-compositional LK step ──────
 // Updates the running/applied global affine. Returns whether GM engages this frame.
@@ -309,7 +378,7 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     // GENERAL, not UNDEFINED).
     for (auto& i : pyrA_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     for (auto& i : pyrB_)    barrier(cmd, i.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    for (int l = kFlowFinest; l < kLevels; ++l) barrier(cmd, pyrAs_[l].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    for (int l = flowFinest_; l < kLevels; ++l) barrier(cmd, pyrAs_[l].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cmd, flowExpA_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(cmd, flowExpB_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     // C2: ping-pong scratch to GENERAL (storage writes require it; contents discarded).
@@ -323,7 +392,7 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     {
         VkClearColorValue zero{};
         VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        for (int l = kFlowFinest; l < kLevels; ++l) {
+        for (int l = flowFinest_; l < kLevels; ++l) {
             VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             b.srcAccessMask = 0; b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -363,19 +432,20 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     // 2c) C1: pre-warp curr luma pyramid by the applied affine → stabilized pyramid
     //     (identity affine ⇒ exact copy, so the flow below is unchanged when
     //     disengaged). The dense flow reads pyrAs from here on.
-    for (int l = kFlowFinest; l < kLevels; ++l) {
+    for (int l = flowFinest_; l < kLevels; ++l) {
         disp(pGmPrewarp_, g_scratch.sGmPrewarp[gmSlot][l], levelExtent(extent_, l));
         bar(pyrAs_[l]);
     }
-    // 3) coarse->fine flow (only down to kFlowFinest — reduced res for perf).
-    //    Curr input is now the STABILIZED pyramid (pyrAs), wired in ensureScratch.
-    for (int l = kLevels - 1; l >= kFlowFinest; --l) {
+    // 3) coarse->fine flow (only down to flowFinest_ — reduced res for perf; the
+    //    finest level is perf_preset-selectable). Curr input is now the STABILIZED
+    //    pyramid (pyrAs), wired in ensureScratch.
+    for (int l = kLevels - 1; l >= flowFinest_; --l) {
         disp(flowP, g_scratch.sFlow[l], levelExtent(extent_, l));
         bar(flowLvl_[l]);
     }
 
     // 3b) ── C2: TV-L1 flow regularization on the finest residual field ──────────
-    // Run frIters semi-implicit TV-L1 denoising iterations on flowLvl_[kFlowFinest]
+    // Run frIters semi-implicit TV-L1 denoising iterations on flowLvl_[flowFinest_]
     // (the object-only residual left by C1). flowLvl_[F] is the fixed data term f0
     // (read, never written here); u ping-pongs A<->B; the final iterate is copied
     // back into flowLvl_[F] so of3_expand consumes the cleaned field unchanged.
@@ -383,7 +453,7 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
     // to pre-C2. Identity/zero iterations is therefore never worse than "no reg".
     const bool frEngaged = (cfg_.frMode != 2) && (cfg_.frIters > 0);
     if (frEngaged) {
-        const int F = kFlowFinest;
+        const int F = flowFinest_;
         const VkExtent2D fe = levelExtent(extent_, F);
         if (g_scratch.flowRegUboPtr) {
             FlowRegUBO fu{cfg_.frDt, cfg_.frLambda, cfg_.frEdge, cfg_.frEps};
@@ -439,7 +509,7 @@ void FrameGen::record(VkCommandBuffer cmd, VkImageView prevView, VkImageView cur
 }
 
 // ---- lazy scratch builder ----
-static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice dev,
+static bool ensureScratch(FrameGen* fg, const DeviceDispatch* dd, VkDevice dev,
                           const VkPhysicalDeviceMemoryProperties& mp, VkDescriptorPool pool,
                           VkSampler samp, VkExtent2D ext,
                           std::vector<FrameGen::Img>& pyrA, std::vector<FrameGen::Img>& pyrB,
@@ -497,7 +567,7 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
     for (int l = 0; l < kLevels; ++l) {
         S.sFlow[l] = allocSet(dd, dev, pool, pFlow.setLayout);
         int pred = (l + 1 < kLevels) ? l + 1 : l;
-        VkImageView currLvl = (l >= FrameGen::kFlowFinest) ? pyrAs[l].view : pyrA[l].view;
+        VkImageView currLvl = (l >= fg->flowFinest()) ? pyrAs[l].view : pyrA[l].view;
         wUbo(dd, dev, S.sFlow[l], 0, S.flowUbo[l], sizeof(FlowUBO));
         wImg(dd, dev, S.sFlow[l], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pyrB[l].view, samp, GEN);
         wImg(dd, dev, S.sFlow[l], 33, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, currLvl, samp, GEN);
@@ -520,7 +590,7 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
     // C1: prewarp sets (one per slot, per solved flow level) — raw curr in, stabilized out.
     for (int s = 0; s < FrameGen::kGmSlots; ++s) {
         S.sGmPrewarp[s].assign(kLevels, VK_NULL_HANDLE);
-        for (int l = FrameGen::kFlowFinest; l < kLevels; ++l) {
+        for (int l = fg->flowFinest(); l < kLevels; ++l) {
             S.sGmPrewarp[s][l] = allocSet(dd, dev, pool, pGmPrewarp.setLayout);
             wUbo(dd, dev, S.sGmPrewarp[s][l], 1,  S.gmUbo[s], sizeof(GMUBO));
             wImg(dd, dev, S.sGmPrewarp[s][l], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, pyrA[l].view, samp, GEN);
@@ -533,7 +603,7 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
         S.sExpand[s] = allocSet(dd, dev, pool, pExpand.setLayout);
         wUbo(dd, dev, S.sExpand[s], 0, S.expandUbo, sizeof(FlowUBO));
         wUbo(dd, dev, S.sExpand[s], 1, S.gmUbo[s], sizeof(GMUBO));
-        wImg(dd, dev, S.sExpand[s], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[FrameGen::kFlowFinest].view, samp, GEN);
+        wImg(dd, dev, S.sExpand[s], 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, flowLvl[fg->flowFinest()].view, samp, GEN);
         wImg(dd, dev, S.sExpand[s], 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expA.view, VK_NULL_HANDLE, GEN);
         wImg(dd, dev, S.sExpand[s], 49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, expB.view, VK_NULL_HANDLE, GEN);
     }
@@ -542,7 +612,7 @@ static bool ensureScratch(FrameGen* /*fg*/, const DeviceDispatch* dd, VkDevice d
     // (binding 34) = prev luma at F (pyrB) for the edge-aware weight. u_in (32) and
     // u_out (48) alternate to realize the ping-pong (see ScratchState comment).
     {
-        const int F = FrameGen::kFlowFinest;
+        const int F = fg->flowFinest();
         S.sFlowReg0  = allocSet(dd, dev, pool, pFlowReg.setLayout);
         S.sFlowRegAB = allocSet(dd, dev, pool, pFlowReg.setLayout);
         S.sFlowRegBA = allocSet(dd, dev, pool, pFlowReg.setLayout);
