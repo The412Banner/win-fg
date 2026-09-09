@@ -301,7 +301,20 @@ strings libwin_fg.so | grep win-fg-build
 ```
 
 For native mode, the chain sources are consumed directly by the host app's build
-rather than linked as a library — see Bannerlator's `cpp/winlator/winfg/`.
+rather than linked as a library — see Bannerlator's `cpp/winlator/winfg/`. That
+build stamps its own equivalent, since a copied-in chain otherwise identifies
+only the *host* commit and not which win-fg is inside it: its CMake sets
+`WINFG_UPSTREAM` (the tag the sources were copied from, hand-set) and
+`WINFG_CHAIN_HASH` (a SHA-256 over the chain sources, computed at configure
+time and therefore impossible to leave stale). Both are logged once at init:
+
+```
+winfg-native: engine ready (chain v0.2.1-5-g1cf96cf, src ec2c1b94bbb7)
+```
+
+Note that the two stamps can legitimately disagree within a single APK — the
+bundled layer `.so` asset and the compiled-in chain are separate artifacts and
+have been different versions in practice.
 
 ## Docs
 
