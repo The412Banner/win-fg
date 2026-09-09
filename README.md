@@ -317,6 +317,60 @@ Note that the two stamps can legitimately disagree within a single APK — the
 bundled layer `.so` asset and the compiled-in chain are separate artifacts and
 have been different versions in practice.
 
+## Using it in your own project
+
+The engine is deliberately small to consume. It owns its own compute pipelines
+and intermediate images and asks the host for very little — which is how the
+same code runs both as a Vulkan layer and compiled into a compositor with no
+changes.
+
+```cpp
+#include "framegen.hpp"
+
+winfg::FrameGen fg;
+fg.init(&deviceDispatch, &instanceDispatch, phys, dev, queueFamily, queue);
+fg.configure(cfg);                              // model, perf_preset, C1/C2, ...
+fg.onResize({width, height}, colorFormat);      // per swapchain size/format
+
+// per generated frame, into your own command buffer:
+fg.record(cmd, prevView, currView, outView, /*alpha=*/0.5f, gmSlot);
+```
+
+**What the host provides**
+
+- **Two dispatch tables** (`DeviceDispatch` / `InstanceDispatch`, ~71 entry
+  points) filled from wherever you resolve Vulkan functions. There is no global
+  loader dependency and no dlopen — hand it function pointers and it uses them.
+  A compositor with its own dispatch table just copies across; see Bannerlator's
+  `winfg_vkd` for a worked example of exactly that.
+- **Two SAMPLED image views** for the previous and current real frames, and one
+  **STORAGE view** for the target the generated frame is written into.
+- **A graphics/compute queue and its family index.** Everything is compute; no
+  render pass, no framebuffer, no swapchain knowledge.
+
+**Two contracts that are not obvious, and both bite silently**
+
+1. **`gmSlot` must be the ring-slot index of the frame context you just
+   fence-waited.** The C1 global-motion estimate is read back on the host one
+   frame late by design; passing the wrong slot means reading a reduce that has
+   not completed. It will not crash — the affine estimate is simply wrong, and
+   the picture warps in ways that look like a flow bug.
+2. **`alpha` is where in time the generated frame sits**, 0 to 1 between prev
+   and curr. 0.5 is the midpoint; the layer build uses 0.35 at 2× because
+   slightly earlier reads as more responsive. If you generate several frames per
+   real pair, space them across the interval.
+
+**What it does not do.** It does not present, acquire, or manage a swapchain; it
+does not decide *when* to generate; it has no opinion about pacing. Those are
+the host's, deliberately — they are exactly the parts that differ between a
+layer inside a game and a compositor on the other side of the window system,
+and keeping them out is why the same chain works in both.
+
+**Cost, so you can budget.** On an Adreno 750 at 1080p the whole chain runs
+~2.5-4.5 ms per generated frame on the Balanced preset. It scales with
+`perf_preset` (the finest pyramid level the flow search reaches) and with the
+C2 iteration count, both live-adjustable.
+
 ## Docs
 
 | File | What |
