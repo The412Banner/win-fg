@@ -1,7 +1,7 @@
 # THIRD-PARTY.md — win-fg attribution ledger
 
 
-> **Note (2026-09-09):** the project is named **Win-FG Native** since the chain
+> **Note (2026-09-09, v0.3.0):** the project is named **Win-FG Native** since the chain
 > moved into the host compositor. Every attribution below is unchanged by that
 > — the same shaders from the same sources are compiled into the host build and
 > into the layer `.so`. No third-party code was added by the move.

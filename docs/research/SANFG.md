@@ -4,7 +4,7 @@
 
 Set 2026-08-17 after the research pass documented in `docs/research/`.
 
-> **Reconciled 2026-09-09.** Phase 1 (classical + adaptive) is largely delivered
+> **Reconciled 2026-09-09, at v0.3.0.** Phase 1 (classical + adaptive) is largely delivered
 > and device-proven, and the project now ships as **Win-FG Native** — the chain
 > compiled into the host compositor rather than injected as a layer. Phase 2 has
 > been *measured*, not merely planned, and the RIFE-fine-tune route named below

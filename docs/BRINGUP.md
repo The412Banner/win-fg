@@ -5,7 +5,7 @@ actually happened**, because everything the original plan called "to do" has
 since shipped and been proven on device. Kept for the gotchas — they are the
 part that generalises to the next device.
 
-## Status
+## Status (v0.3.0)
 
 Both builds are up and device-proven on an AYANEO Pocket FIT (Adreno 750,
 Snapdragon 8 Gen 3, 144 Hz, Turnip), and the layer build additionally on a

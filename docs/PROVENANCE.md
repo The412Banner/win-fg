@@ -6,7 +6,7 @@ Where every part of win-fg comes from, how it's built, and under what license.
 
 ## What Win-FG Native is
 
-> **Note (2026-09-09):** the project is named **Win-FG Native** since the chain
+> **Note (2026-09-09, v0.3.0):** the project is named **Win-FG Native** since the chain
 > moved host-side. Provenance is unaffected by where it runs — the same shaders,
 > from the same sources, are compiled into the host compositor and into the
 > layer `.so`. Build outputs keep their original names (`libwin_fg.so`,

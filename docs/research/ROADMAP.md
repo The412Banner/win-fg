@@ -39,7 +39,7 @@ continuous change, not on/off toggles):
 Any future branch that adds runtime on/off transitions of FG dispatch
 gets rejected up front.
 
-## Current state (2026-09-09)
+## Current state (2026-09-09, v0.3.0)
 
 | Component | State |
 |---|---|

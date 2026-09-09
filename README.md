@@ -3,7 +3,7 @@
 **Clean-room frame generation for Vulkan** — content-adaptive frame
 synthesis for Android emulation (Winlator / Wine on Adreno).
 
-> **Status: v0.2.1 — device-proven, private repo.** The classical adaptive
+> **Status: v0.3.0 — device-proven, private repo.** The classical adaptive
 > quality path is complete and validated on hardware. The shipping form is
 > **Win-FG Native**: the chain compiled directly into
 > [Bannerlator](https://github.com/The412Banner/Bannerlator)'s own Vulkan
@@ -29,8 +29,9 @@ files. It takes the previous and current real frames and synthesizes an
 in-between frame, so the display sees ~2× the source FPS with no additional
 game rendering.
 
-Born from the [bionic-fg takedown](#clean-room-protocol): every shader is
-written from published algorithms, no proprietary bytecode or weights. Nothing
+Born from the bionic-fg takedown (see **Clean-room protocol** below): every
+shader is written from published algorithms, no proprietary bytecode or
+weights. Nothing
 has to be bought, downloaded or imported for it to work — which is the whole
 point, and the practical difference from LSFG-based frame generation.
 
@@ -63,7 +64,7 @@ pipeline from shaders parsed out of a user-supplied DLL). win-fg's shaders are
 embedded, so there is no multi-second stall when frame generation is switched
 on mid-game.
 
-## v0.2 — the quality stack (device-proven)
+## The quality stack (device-proven, landed in v0.2)
 
 Validated on AYANEO Pocket FIT / Adreno 750, DiRT Rally 2.0 and DiRT Showdown.
 Three quality layers, each independently gate-able and each provably degrading
@@ -218,7 +219,7 @@ than silently trusted. Byte layout in `src/capture.hpp`.
 
 ## Roadmap
 
-- ✅ **Done (v0.2 / v0.2.1):** anti-ghost, C1 global-motion pre-warp, C2 TV-L1
+- ✅ **Done (through v0.3.0):** anti-ghost, C1 global-motion pre-warp, C2 TV-L1
   flow-reg, perf-preset, present-id fix, native-mode integration. Device-proven,
   shipped in Bannerlator.
 - ⏭️ **Next (classical polish):**
@@ -309,7 +310,7 @@ only the *host* commit and not which win-fg is inside it: its CMake sets
 time and therefore impossible to leave stale). Both are logged once at init:
 
 ```
-winfg-native: engine ready (chain v0.2.1-5-g1cf96cf, src ec2c1b94bbb7)
+winfg-native: engine ready (chain v0.3.0, src ec2c1b94bbb7)
 ```
 
 Note that the two stamps can legitimately disagree within a single APK — the
@@ -330,9 +331,9 @@ have been different versions in practice.
 
 ## Clean-room protocol
 
-win-fg exists because [bionic-fg was taken down](https://github.com/The412Banner/Bannerlator)
-in 2026-08 for shipping SPIR-V shader bytecode derived from proprietary
-Lossless Scaling weights. **We do not repeat that mistake.** Every artifact:
+This project exists because bionic-fg was taken down in 2026-08 for shipping
+SPIR-V shader bytecode derived from proprietary Lossless Scaling work. That
+project is deliberately named but not linked here. **We do not repeat that mistake.** Every artifact:
 1. MIT-original or borrowed from an MIT/BSD/Apache/zlib repo with attribution.
 2. Every `.comp` header cites the paper / algorithm it implements.
 3. Phase-2 weights are trained on self-captured footage, optionally warm-started
