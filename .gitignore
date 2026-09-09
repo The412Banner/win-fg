@@ -2,3 +2,6 @@ build/
 *.spv
 vk-headers/
 .claude/
+
+# local scratch helpers
+watch_*.sh
