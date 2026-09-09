@@ -1,5 +1,15 @@
 # 02 — Learned Frame Interpolation Models
 
+
+> **⚠️ Overtaken by measurement, 2026-08-31.** This survey recommended
+> fine-tuning RIFE-4.25.lite as the Phase-2 base. We instead trained our own
+> IFNet-lite from scratch on self-captured data (414K → 26.88 dB, shrunk to
+> 112K → 25.85 dB) and measured it on an Adreno 750: **16 ms @256, 35 ms
+> @360p, 117 ms @720p against a 2-4 ms budget.** Full-synthesis CNNs of this
+> family do not fit, at any size we tested. The model survey below is still
+> accurate as a survey; the *recommendation* is superseded by the tiny
+> conv-only residual design in `ROADMAP.md` Tier 4.
+
 Research pass 2026-08-17. Scope: what learned VFI models exist, what they
 cost in params/MB, what license they ship under, and which — if any — we
 could realistically train, fine-tune, and ship on Adreno-class mobile

@@ -1,5 +1,10 @@
 # THIRD-PARTY.md — win-fg attribution ledger
 
+
+> **Note (2026-09-09):** the project is named **Win-FG Native** since the chain
+> moved into the host compositor. Every attribution below is unchanged by that
+> — the same shaders from the same sources are compiled into the host build and
+> into the layer `.so`. No third-party code was added by the move.
 Every third-party pattern, algorithm, or design idea used in win-fg —
 attributed by name, source, and license. This is the audit trail for the
 clean-room protocol described in `docs/PROVENANCE.md`.

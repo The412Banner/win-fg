@@ -1,5 +1,16 @@
 # 04 — Adreno / Android Deployment for Compute-Heavy FG + ML
 
+
+> **⚠️ Partly overtaken by measurement, 2026-08-31.** The runtime survey
+> below is still accurate, but the ncnn-Vulkan recommendation was tested on a
+> real Adreno 750 and does not hold for full-synthesis nets: ~10-30x over
+> budget at every usable resolution, only ~280-310 GFLOP/s realized (no
+> cooperative-matrix on Turnip, dispatches too small), and **`GridSample` is
+> `support_vulkan=0`** so the network's warps fall back to CPU entirely. The
+> extension notes (`VK_KHR_present_wait`, `VK_EXT_present_timing`) remain
+> valid and one of them — present-id handling — turned out to be the root
+> cause of the Adreno 840 freeze; see `../BRINGUP.md`.
+
 Research pass 2026-08-17. Scope: how compute-heavy FG (and eventual ML
 inference) actually runs on Adreno / Android — runtimes, Vulkan
 extensions, licensing, real shipping FG on mobile, and a reality check.

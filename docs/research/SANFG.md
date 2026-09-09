@@ -3,6 +3,13 @@
 **The endgame vision for win-fg.**
 
 Set 2026-08-17 after the research pass documented in `docs/research/`.
+
+> **Reconciled 2026-09-09.** Phase 1 (classical + adaptive) is largely delivered
+> and device-proven, and the project now ships as **Win-FG Native** — the chain
+> compiled into the host compositor rather than injected as a layer. Phase 2 has
+> been *measured*, not merely planned, and the RIFE-fine-tune route named below
+> was retired on the numbers; see "Phase 2, as measured" at the bottom and
+> `ROADMAP.md` Tier 4.
 Locking in the naming and positioning so every doc that follows points
 at the same target.
 
@@ -23,12 +30,12 @@ at the same target.
 | **Clean-room** | Zero code/coefficients/bytecode borrowed verbatim from any FG project. All patterns implemented from cited papers. | Enforced. See `docs/PROVENANCE.md`. |
 | **Self-tuning** | No user knobs for quality/perf balance — only a master switch and an optional "quality vs speed" bias | Roadmap: 9-item adaptive-heuristics menu |
 | **Content-adaptive** | Different rendering path for HUD vs world, static vs high-motion, low-texture vs high-detail | Roadmap: `feat/hud-rect-mask` in flight, `feat/heuristic-hud-detect` next |
-| **Neural frame synthesis** | Interpolation quality via CNN, not just flow-warp | Aspiration — depends on RIFE-4.25.lite fine-tune |
+| **Neural frame synthesis** | Interpolation quality via CNN, not just flow-warp | Re-scoped 2026-08-31 — full-synthesis CNN measured 10-30x over budget on Adreno; surviving design is a tiny conv-only residual on top of classical flow |
 | **Vulkan** | Ships as Vulkan implicit layer, works with any game that runs through Vulkan (i.e., every DXVK/VKD3D/Wine Vulkan game on Bannerlator) | Shipped |
 | **Motion-aware** | Handles camera motion separately from object motion (global-motion pre-warp) | Roadmap: `feat/global-motion-prewarp` |
 | **HUD-aware** | UI/HUD regions excluded from flow warping so text/overlays don't ghost | In flight: `feat/hud-rect-mask` at `22faf40` |
 | **Per-game learned presets** | Best-known tuning cached per-game across sessions | Roadmap: `feat/per-game-preset-cache` |
-| **On-device inference** | Weights + inference stay on device (privacy, offline, no cloud), sized to fit APK asset | Aspiration — 8-12 MB target for RIFE-lite fp16 |
+| **On-device inference** | Weights + inference stay on device (privacy, offline, no cloud), sized to fit APK asset | Still the target, but far smaller than 8-12 MB: our own 112K-param net already ran 10x over budget through ncnn-Vulkan |
 | **License-clean** | Every shipped artifact defensible under MIT + attribution. No LSFG-derived, no proprietary bytecode. | Enforced from day one. `THIRD-PARTY.md` tracks every borrowed pattern. |
 
 ## Success criteria — how we know when we're done
@@ -101,3 +108,23 @@ Every artifact win-fg ships must satisfy:
 
 **This is non-negotiable.** The bionic-fg takedown is the reason this
 project exists; we don't repeat it.
+
+## Phase 2, as measured (2026-08-31)
+
+The plan above named a fine-tuned RIFE-4.25.lite as the Phase-2 base. It was
+taken far enough to measure and then retired on the numbers. Recorded here so
+the gate is judged against evidence rather than the original aspiration.
+
+- Trained from scratch on our own captured triplets — no scraped data, no
+  pretrained weights. IFNet-lite 414K → **26.88 dB**; shrunk to 112K →
+  **25.85 dB**. The architecture shrinks gracefully.
+- On a real Adreno 750 through ncnn-Vulkan fp16: **16 ms @256, 35 ms @360p,
+  117 ms @720p**, against a 2-4 ms budget.
+- `GridSample` is `support_vulkan=0` in ncnn, so the warps fall to CPU; and the
+  full-res refine head is ~70% of cost at every resolution.
+
+**The surviving Phase-2 design** is a *tiny conv-only residual* correcting the
+classical flow output — no warps in the neural part, ideally at reduced
+resolution — with the classical FSR3-family chain doing flow and warping on the
+GPU where it is effectively free. Gate 6 (transparency artifacts) remains the
+quality target it was written as; the route to it changed, not the goal.

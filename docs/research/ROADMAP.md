@@ -7,6 +7,12 @@ by ROI to the SANFG endgame described in `SANFG.md`.
 **Every branch listed here has a citation trail.** Follow the linked
 research doc for algorithm sources and license notes.
 
+> **Maintained doc — last reconciled with reality 2026-09-09.** The tiered
+> branch list below was written 2026-08-17; items that have since shipped are
+> marked ✅ in place rather than deleted, so the citation trail survives. The
+> current-state table and the Tier-4 (neural) section have been rewritten
+> against on-device measurement — see `PROGRESS_LOG.md` for the dated detail.
+
 ## Design principle — FG is binary (2026-08-17)
 
 **Frame generation is either fully on or fully off — no runtime toggling.**
@@ -33,18 +39,31 @@ continuous change, not on/off toggles):
 Any future branch that adds runtime on/off transitions of FG dispatch
 gets rejected up front.
 
-## Current state (2026-08-17)
+## Current state (2026-09-09)
 
 | Component | State |
 |---|---|
-| Vulkan layer scaffold | Shipped (`libwin_fg.so` in Bannerlator/main asset) |
-| Phase 3a — interpolate + blit | Shipped |
-| Phase 3b — true 2× spare-image insertion | Shipped (`61113bc`) |
-| swapchain +1 (Isygold pattern port) | Shipped (`c91bb50`) |
-| synth alpha 0.5 → 0.35 | Shipped (`2f50e40`) |
-| `feat/hud-rect-mask` — HUD-rect exclusion push const | In flight, `22faf40`, CI green, hotswappable |
-| Device-verified fps lift | 84 → 105 fps DiRT (25% doubling) |
-| Known symptoms remaining | HUD ghost, camera-pan melt, sub-100% doubling |
+| **Win-FG Native** — chain compiled into Bannerlator's compositor | ✅ Shipped, device-proven |
+| Vulkan layer build (`libwin_fg.so`) | ✅ Shipped; retained for training capture |
+| Phase 3a — interpolate + blit | ✅ Shipped |
+| Phase 3b — true 2× spare-image insertion | ✅ Shipped (`61113bc`) |
+| swapchain +1 (Isygold pattern port) | ✅ Shipped (`c91bb50`) |
+| synth alpha 0.5 → 0.35 | ✅ Shipped (`2f50e40`) |
+| HUD-rect exclusion | ✅ Shipped |
+| Anti-ghost (parabola fit, 5-tap median, content-diff snap) | ✅ Shipped |
+| **C1 · global-motion pre-warp** (was T2-E) | ✅ Shipped, engages automatically |
+| **C2 · TV-L1 flow regularization** (was T3-A) | ✅ Shipped, 4 iterations default |
+| `perf_preset` (flow-resolution knob, live rebuild) | ✅ Shipped |
+| Adreno 840 / Fold 8 present-id freeze | ✅ Fixed + device-proven 2026-08-26 |
+| Training capture (`.wfgcap`) | ✅ Shipped + validated (73,986 real triplets) |
+| Device-verified fps lift — **native** | **45 → 90 @ 2× (system counter); 58 → 115 uncapped** |
+| Device-verified fps lift — layer | 84 → 105 (≈25% doubling; the host discarded the rest) |
+| Known symptoms remaining | 3×/4× cost (no flow/synth split), no rate telemetry, pacing off by default |
+
+The older 2026-08-17 table listed "HUD ghost, camera-pan melt, sub-100%
+doubling" as the open symptoms. Camera-pan melt is addressed by C1+C2;
+sub-100% doubling was the host discarding the layer's frames and is solved by
+running native.
 
 ## Priority order — Tier 1 (small, high ROI, ships weeks not months)
 
@@ -62,7 +81,7 @@ clean-room, all inside `libwin_fg.so`.
 
 ### ~~T1-C. `feat/tier-gated-auto`~~ — REJECTED (see design principle above)
 
-### T1-D. `feat/median-flow-filter`
+### ~~T1-D. `feat/median-flow-filter`~~ — ✅ SHIPPED (5-tap median in `of3_expand`)
 - **What:** 3×3 median filter post-process on `of3_flow` output. Kills outlier flow vectors.
 - **Effort:** ~30 LOC GLSL + 1 dispatch stage.
 - **Source:** `06-max-winnative-inspirations.md` (Max's `flowfix.comp` pattern; algorithm = Tukey 1977 median-as-robust-estimator).
@@ -106,7 +125,7 @@ Each ~3-7 days of shader authoring + wiring + hotswap testing.
 - **Source:** `08-reusable-shaders.md` #2 — FSR3 `ffx_frameinterpolation_inpainting_pass.glsl` + inpainting pyramid pair (MIT).
 - **Fixes:** the "black region where flow was untrusted" failure mode we currently don't handle.
 
-### T2-E. `feat/global-motion-prewarp`
+### ~~T2-E. `feat/global-motion-prewarp`~~ — ✅ SHIPPED as C1
 - **What:** fit 6-parameter affine between prev/curr via Lucas-Kanade, warp `I1` before dense flow → residual flow is object-only.
 - **Effort:** ~150 LOC across 2 shaders (`of3_gm_reduce.comp` + `of3_gm_prewarp.comp`) + CPU 6×6 solve.
 - **Source:** `01-optical-flow-algorithms.md` (Szeliski Ch. 6.2 + Baker-Matthews 2001 inverse-compositional LK).
@@ -114,7 +133,7 @@ Each ~3-7 days of shader authoring + wiring + hotswap testing.
 
 ## Priority order — Tier 3 (big, structural)
 
-### T3-A. `feat/flow-regularization` (+ `of3_flowreg.comp`)
+### ~~T3-A. `feat/flow-regularization` (+ `of3_flowreg.comp`)~~ — ✅ SHIPPED as C2
 - **What:** TV-L1 smoothness prior post-process on flow field.
 - **Effort:** ~60 LOC GLSL.
 - **Source:** `01-optical-flow-algorithms.md` (Horn-Schunck 1981 or Chambolle-Pock TV-L1).
@@ -126,34 +145,68 @@ Each ~3-7 days of shader authoring + wiring + hotswap testing.
 - **Source:** `01-optical-flow-algorithms.md` (RAFT-family standard, PWC-Net).
 - **Fixes:** flow quality on fast motion. Major step toward PWC-Net-2018-level classical flow.
 
-### T3-C. `feat/capture-mode`
+### ~~T3-C. `feat/capture-mode`~~ — ✅ SHIPPED and validated on real data
 - **What:** `WFG_CAPTURE_DIR` env dumps prev/mid/curr triplets from present hook. Feeds training pipeline + confidence auto-calibration.
 - **Effort:** ~80 LOC C++.
 - **Source:** `03-training-pipelines.md` §2 + `06-max-winnative-inspirations.md` (Max's empirical calibration workflow).
 - **Fixes:** enables Phase 2 (neural). Also drives auto-calibration of gate thresholds.
 - **Depends on:** nothing (independent branch).
 
-## Priority order — Tier 4 (neural — Phase 2 gate)
+## Priority order — Tier 4 (neural — Phase 2) — ⚠️ RE-SCOPED BY MEASUREMENT 2026-08-31
 
-Only start once Tier 1-3 ships and all 5 classical SANFG success gates are hit.
+**The original Tier 4 (fine-tune RIFE-4.25.lite, run it through ncnn-Vulkan) was
+built far enough to measure, and it does not fit this hardware.** Kept here in
+full because the numbers are the useful part — do not re-plan this from theory.
 
-### T4-A. `feat/rife-lite-fine-tune`
-- **What:** fine-tune RIFE-4.25.lite (MIT) on 50-150K self-captured Bannerlator triplets with Charbonnier + Laplacian + Census + Warp loss + HUD-preservation extension.
-- **Effort:** 4-6 weeks — capture pipeline (`feat/capture-mode` prereq) + training rig (weekend on RTX 4080) + on-device deploy tuning.
-- **Source:** `02-learned-fg-models.md` (RIFE-4.25.lite recommendation) + `03-training-pipelines.md` (end-to-end pipeline).
-- **License:** MIT, warm-start from hzwer's public checkpoint, fine-tune erases Vimeo90K taint via data replacement, ship modified weights under MIT.
+### ~~T4-A. `feat/rife-lite-fine-tune`~~ / ~~T4-B. `feat/ncnn-vulkan-inference`~~ — MEASURED, NOT VIABLE AS SPECIFIED
 
-### T4-B. `feat/ncnn-vulkan-inference`
-- **What:** integrate NCNN Vulkan backend to run the fine-tuned RIFE weights on device. Ship `.param/.bin` as APK asset.
-- **Effort:** 2-3 weeks.
-- **Source:** `04-adreno-deployment.md` + `08-reusable-shaders.md` (RIFE `warp_pack4.comp` reference).
-- **Reference impl:** Allen Kuo's Android RIFE Medium series (2026-04).
+What was actually done, on our own captured data, from scratch (no scraped
+datasets, no pretrained weights):
+
+| Model | Params | Val PSNR (our hard game set) |
+|---|---|---|
+| IFNet-lite v5 (full) | 414K | **26.88 dB** |
+| shrink-v1 (widths 64/48/32) | 206K | 26.28 dB |
+| shrink-v2 (48/32/24 + half-res refine) | **112K** | 25.85 dB |
+
+Quality shrinks gracefully — 27% of the parameters for −1.0 dB. The problem is
+runtime, measured on a real Adreno 750 (Pocket FIT, Snapdragon 8 Gen 3) through
+ncnn-Vulkan fp16, GPU genuinely engaged (CPU backend was 4.2× slower):
+
+| Resolution | shrink-v1 backbone |
+|---|---|
+| 256 | 16 ms |
+| 360p | 35 ms |
+| 720p | 117 ms |
+
+Against a **2–4 ms** budget. Ten to thirty times over at any usable resolution.
+Two blockers beyond raw speed:
+
+1. **`GridSample` is `support_vulkan=0` in ncnn** — the net's four warps fall
+   back to CPU, which breaks the pipeline outright.
+2. The full-resolution **refine head is ~70% of total cost** at every resolution.
+
+Also: the exact ONNX will not fully load in ncnn — four `ScatterND` ops
+(grid-from-flow) have no ncnn layer even after constant-folding (278 → 113
+layers). Needs pnnx or a warp re-formulation.
+
+### T4-D. `feat/neural-residual` — the surviving design
+
+Keep flow and warping **classical** — the shipped FSR3-family shaders, already
+on the GPU and effectively free — and add a **tiny conv-only residual** as the
+sole neural cost: no GridSample, no warps in the neural part, ideally at reduced
+resolution. shrink-v2 already showed that a reduced-resolution correction head
+holds quality, which is the core bet.
+
+**Prerequisite:** measure the real classical FSR3 baseline on-device and train
+the residual against *that*. The earlier residual attempt (v6, 148K, 22.66 dB)
+scored badly because its stand-in baseline was weak (21.32), not because the
+design is wrong.
 
 ### T4-C. `feat/qnn-htp-delegate` (optional Snapdragon fast path)
-- **What:** ONNX → QDQ INT8/INT16 → QNN Execution Provider → Hexagon HTP.
-- **Effort:** 3-4 weeks.
-- **Source:** `04-adreno-deployment.md` (QNN SDK survey).
-- **Fixes:** 3-4× inference speedup on Snapdragon devices. Falls back to NCNN Vulkan elsewhere.
+
+Unchanged as an idea, but gated behind T4-D — there is no point routing a model
+to the NPU until there is a model small enough to be worth routing.
 
 ## What's missing today — gap analysis
 

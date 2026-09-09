@@ -4,7 +4,14 @@ Where every part of win-fg comes from, how it's built, and under what license.
 
 > Verified current as of 2026-08-12 (through device bring-up).
 
-## What win-fg is
+## What Win-FG Native is
+
+> **Note (2026-09-09):** the project is named **Win-FG Native** since the chain
+> moved host-side. Provenance is unaffected by where it runs — the same shaders,
+> from the same sources, are compiled into the host compositor and into the
+> layer `.so`. Build outputs keep their original names (`libwin_fg.so`,
+> `VkLayer_win_framegen.json`).
+
 
 A color-only frame-generation layer for Android / Vulkan (Turnip / Adreno). From
 two real frames it synthesises an interpolated in-between frame to raise perceived
